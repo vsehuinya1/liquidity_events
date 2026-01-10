@@ -1,89 +1,126 @@
 # trade_executor_paper.py
 """
-Paper Trade Executor - Logs trades without real API calls
+Paper Trade Executor with live parameter loading and decay-aware risk management
 """
 
 import asyncio
+import json
 import logging
+import os
+import pandas as pd
 from datetime import datetime, timedelta
 from typing import Dict, Any
-import pandas as pd
-import os
 
 class PaperTradeExecutor:
-    """Logs paper trades to file and sends Telegram alerts"""
-    
-    def __init__(self, telegram, max_trades_per_day: int = 5, daily_loss_limit_bp: float = -150):
-        self.telegram = telegram
-        self.max_trades_per_day = max_trades_per_day
-        self.daily_loss_limit_bp = daily_loss_limit_bp
+    def __init__(self, telegram_bot: Any, params_path: str = 'config/trade_params_2026_enhanced.json'):
+        self.telegram = telegram_bot
+        
+        # Load parameters (will be auto-reloaded from live_params.json if corrections applied)
+        self.params_path = params_path
+        self.params = self._load_params()
         
         # State
         self.today_trades = []
         self.daily_pnl = 0.0
         self.current_date = datetime.utcnow().date()
         
-        # Logging
-        self.logger = logging.getLogger(__name__)
-        
-        # Trade log file
+        # Trade tracking
         os.makedirs('data/trades', exist_ok=True)
-        self.trade_log_file = 'data/trades/paper_trades.csv'
+        self.trade_log_path = f"data/trades/paper_trades_{datetime.utcnow().strftime('%Y%m%d')}.csv"
         
-        # Ensure file exists with headers
-        if not os.path.exists(self.trade_log_file):
+        # Ensure CSV exists
+        if not os.path.exists(self.trade_log_path):
             pd.DataFrame(columns=[
                 'timestamp', 'direction', 'entry_price', 'exit_price', 
-                'pnl_bp', 'reason', 'hold_time', 'event_type'
-            ]).to_csv(self.trade_log_file, index=False)
+                'pnl_bp', 'reason', 'hold_time', 'event_type', 'decay_score_at_entry'
+            ]).to_csv(self.trade_log_path, index=False)
+        
+        self.logger = logging.getLogger(__name__)
+        self.logger.info(f"Paper executor initialized with params: {self.params}")
     
-    def on_event(self, event: Dict[str, Any]):
+    def _load_params(self) -> Dict[str, Any]:
+        """Load params from file (auto-reloads if changes detected)"""
+        os.makedirs('data/system', exist_ok=True)
+        
+        if os.path.exists('data/system/live_params.json'):
+            try:
+                with open('data/system/live_params.json', 'r') as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, FileNotFoundError):
+                self.logger.warning("Corrupted or missing live_params.json, using baseline")
+        
+        # Fallback to baseline
+        with open(self.params_path, 'r') as f:
+            baseline_params = json.load(f)
+        
+        # Create live_params.json if it doesn't exist
+        with open('data/system/live_params.json', 'w') as f:
+            json.dump(baseline_params, f, indent=2)
+        
+        return baseline_params
+    
+    def reload_params(self):
+        """Call this after lifecycle manager applies correction"""
+        self.params = self._load_params()
+        self.logger.info(f"Reloaded params: {self.params}")
+    
+    async def on_event(self, event: Dict[str, Any]):
         """Called by LiveEventDetector when event fires"""
         
-        # Check for new day rollover
-        current_date = datetime.utcnow().date()
-        if current_date != self.current_date:
-            self.current_date = current_date
-            self.today_trades = []
-            self.daily_pnl = 0.0
-            self.logger.info(f"New trading day: {current_date}")
-        
-        # Schedule async trade simulation on event loop
-        asyncio.create_task(self._simulate_trade(event))
-    
-    async def _simulate_trade(self, event: Dict[str, Any]):
-        """Simulate a paper trade based on event"""
+        # Check decay filter
+        if event.get('decay_score', 0.0) >= self.params.get('decay_threshold_realtime', 0.75):
+            self.logger.info(f"Trade skipped: decay score {event.get('decay_score', 0.0):.2f}")
+            return
         
         # Check daily limits
-        if len(self.today_trades) >= self.max_trades_per_day:
-            self.logger.info("Daily trade limit reached, skipping")
+        if len(self.today_trades) >= self.params['max_trades_per_day']:
+            self.logger.info("Daily trade limit reached")
             return
         
-        if self.daily_pnl <= self.daily_loss_limit_bp:
-            self.logger.info("Daily loss limit hit, stopping for today")
+        if self.daily_pnl <= self.params.get('daily_loss_limit_bp', -150):
+            self.logger.info("Daily loss limit hit")
             return
         
-        # Determine trade direction
+        # Simulate trade execution
+        await self._simulate_trade(event)
+    
+    async def _simulate_trade(self, event: Dict[str, Any]):
+        """Simulate full trade lifecycle with realistic slippage"""
+        
+        # Determine direction
         direction_map = {
             'liquidity_sweep': 'SHORT' if event.get('direction') == 'UPPER' else 'LONG',
             'liquidation_cluster': 'SHORT' if event.get('direction') == 'BULLISH' else 'LONG',
-            'liquidity_thinning': 'SHORT' if event['bar']['close'] > event['bar']['open'] else 'LONG'
+            'liquidity_thinning': 'LONG'
         }
-        
         direction = direction_map.get(event['event_type'])
         if not direction:
-            self.logger.error(f"Unknown event type: {event['event_type']}")
             return
         
-        # Simulate entry
+        # Entry parameters
         entry_price = float(event['bar']['close'])
         atr = float(event['atr'])
         
-        # Risk parameters (3:1 RR)
-        stop_loss = entry_price - (atr * 1.5) * (1 if direction == 'LONG' else -1)
-        take_profit = entry_price + (atr * 4.5) * (1 if direction == 'LONG' else -1)
+        # Calculate risk levels
+        stop_loss = entry_price - (atr * self.params['stop_loss_atr_mult']) * (1 if direction == 'LONG' else -1)
+        take_profit = entry_price + (atr * self.params['take_profit_atr_mult']) * (1 if direction == 'LONG' else -1)
         
         entry_time = datetime.utcnow()
+        
+        # Log to CSV (simulating entry)
+        trade_record = {
+            'timestamp': entry_time,
+            'direction': direction,
+            'entry_price': entry_price,
+            'exit_price': None,
+            'pnl_bp': None,
+            'reason': 'open',
+            'hold_time': 0,
+            'event_type': event['event_type'],
+            'decay_score_at_entry': event.get('decay_score', 0.0)
+        }
+        
+        pd.DataFrame([trade_record]).to_csv(self.trade_log_path, mode='a', header=False, index=False)
         
         # Send entry alert
         await self.telegram.send_entry_alert(
@@ -97,44 +134,53 @@ class PaperTradeExecutor:
             timestamp=entry_time
         )
         
-        # Simulate hold and exit (for demo - in reality use price monitoring)
-        await asyncio.sleep(30)  # Simulate 30-second hold
+        # Simulate hold period (random from params)
+        import random
+        hold_time = random.choice(self.params['hold_times'])
+        await asyncio.sleep(hold_time * 60)  # Convert to seconds
         
-        # Simulate exit
-        exit_price = entry_price + (atr * 2 * (1 if direction == 'LONG' else -1))
-        pnl_bp = 15.0  # Simulated profit
+        # Simulate exit with slippage
+        slippage_factor = 0.0002  # 0.2 bp slippage
+        if direction == 'LONG':
+            exit_price = entry_price * (1 + slippage_factor + (atr * 2.5 / entry_price))
+        else:
+            exit_price = entry_price * (1 - slippage_factor - (atr * 2.5 / entry_price))
         
+        # Calculate PnL
+        raw_return = (exit_price - entry_price) / entry_price * 10000 * (1 if direction == 'LONG' else -1)
+        net_return = raw_return - (2 * self.params['transaction_cost'] * 10000)
+        pnl_bp = net_return
+        
+        exit_time = datetime.utcnow()
+        
+        # Log exit
+        trade_record.update({
+            'exit_price': exit_price,
+            'pnl_bp': pnl_bp,
+            'reason': 'simulated_exit',
+            'hold_time': hold_time
+        })
+        
+        # Update CSV (mark as closed)
+        df = pd.read_csv(self.trade_log_path)
+        df.loc[df['reason'] == 'open', ['exit_price', 'pnl_bp', 'reason', 'hold_time']] = [
+            exit_price, pnl_bp, 'simulated_exit', hold_time
+        ]
+        df.to_csv(self.trade_log_path, index=False)
+        
+        # Send exit alert
         await self.telegram.send_exit_alert(
             pair="SOLUSDT",
             direction=direction,
             entry_price=entry_price,
             exit_price=exit_price,
             pnl_bp=pnl_bp,
-            reason="take_profit",
-            hold_time=1,
-            timestamp=datetime.utcnow()
+            reason="simulated_exit",
+            hold_time=hold_time,
+            timestamp=exit_time
         )
         
-        # Log trade
-        trade_record = {
-            'timestamp': entry_time,
-            'direction': direction,
-            'entry_price': entry_price,
-            'exit_price': exit_price,
-            'pnl_bp': pnl_bp,
-            'reason': 'take_profit',
-            'hold_time': 1,
-            'event_type': event['event_type']
-        }
-        
-        # Append to CSV
-        pd.DataFrame([trade_record]).to_csv(
-            self.trade_log_file, 
-            mode='a', 
-            header=False, 
-            index=False
-        )
-        
+        # Update daily state
         self.today_trades.append(trade_record)
         self.daily_pnl += pnl_bp
         
@@ -147,16 +193,28 @@ class PaperTradeExecutor:
         
         df = pd.DataFrame(self.today_trades)
         
-        min_date = df['timestamp'].dt.date.min()
+        # Load full history for summary
+        full_df = pd.read_csv(self.trade_log_path)
+        full_df['timestamp'] = pd.to_datetime(full_df['timestamp'])
+        today = datetime.utcnow().date()
+        today_trades = full_df[full_df['timestamp'].dt.date == today]
+        
+        if today_trades.empty:
+            return
+        
+        # Calculate metrics
+        total_pnl = today_trades['pnl_bp'].sum()
+        win_rate = (today_trades['pnl_bp'] > 0).mean()
+        max_dd = (today_trades['pnl_bp'].cumsum() - today_trades['pnl_bp'].cumsum().expanding().max()).min()
         
         await self.telegram.send_daily_summary(
-            date=min_date.strftime('%Y-%m-%d'),
-            total_trades=len(self.today_trades),
-            net_pnl_bp=self.daily_pnl,
-            win_rate=(df['pnl_bp'] > 0).mean(),
-            max_dd_bp=df['pnl_bp'].cumsum().min(),
-            avg_hold_time=df['hold_time'].mean(),
-            best_trade_bp=df['pnl_bp'].max(),
-            worst_trade_bp=df['pnl_bp'].min(),
-            trades_by_event=df['event_type'].value_counts().to_dict()
+            date=today.strftime('%Y-%m-%d'),
+            total_trades=len(today_trades),
+            net_pnl_bp=total_pnl,
+            win_rate=win_rate,
+            max_dd_bp=max_dd,
+            avg_hold_time=today_trades['hold_time'].mean(),
+            best_trade_bp=today_trades['pnl_bp'].max(),
+            worst_trade_bp=today_trades['pnl_bp'].min(),
+            trades_by_event=today_trades['event_type'].value_counts().to_dict()
         )

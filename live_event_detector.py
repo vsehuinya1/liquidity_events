@@ -9,6 +9,8 @@ from typing import Dict, Any, Optional, Callable
 import asyncio
 import os
 from telegram_bot import TelegramBot
+from collections import deque
+import json
 
 # ============================================================================
 # LIVE EVENT DETECTOR
@@ -30,7 +32,7 @@ class LiveEventDetector:
     """
     
     def __init__(self, event_callback: Optional[Callable[[Dict[str, Any]], None]] = None, 
-                 enable_telegram: bool = True):
+                 enable_telegram: bool = True, telegram_bot=None):
         # Parameters directly from locked script
         self.SWEEP_PARAMS = {
             'range_mult': 1.8,
@@ -56,8 +58,15 @@ class LiveEventDetector:
         self.pending_thinning_events = []  # Pending confirmations
         self.event_callback = event_callback or self._default_callback
         
+        # Decay radar configuration
+        self.enable_decay_filter = True
+        self.decay_threshold = 0.75  # From params file
+        
+        # Decay metric buffers
+        self._init_decay_metrics()
+        
         # Telegram integration for paper trading alerts
-        self.telegram = TelegramBot() if enable_telegram else None
+        self.telegram = telegram_bot if telegram_bot else (TelegramBot() if enable_telegram else None)
         
         # Synchronization
         self.lock = threading.Lock()
@@ -65,7 +74,64 @@ class LiveEventDetector:
         # Logging
         self._setup_logging()
         
-        self.logger.info("LiveEventDetector initialized with Telegram alerts")
+        self.logger.info("LiveEventDetector with decay radar initialized")
+
+    def _init_decay_metrics(self):
+        """Initialize decay tracking buffers"""
+        self.sol_decay_buffer = deque(maxlen=48)  # 4 hours of 5-min bars
+        self.last_decay_score = 0.0
+
+    def _update_decay_metrics(self, bar: Dict[str, Any]):
+        """Calculate decay sub-scores after each bar"""
+        if len(self.buffer) < 48:
+            return
+        
+        df = pd.DataFrame(list(self.buffer))
+        latest = df.iloc[-1]
+        
+        # Sub-signal 1: Micro-volatility surge
+        vol_24h = df['range'].rolling(288, min_periods=1).median().iloc[-1]
+        vol_short = df['range'].rolling(12, min_periods=1).std().iloc[-1]
+        vol_score = min(vol_short / (vol_24h + 1e-6), 1.0)
+        
+        # Sub-signal 2: Wick alternation
+        wick_alt = ((df['upper_wick_pct'] > 0.25) & (df['lower_wick_pct'].shift() > 0.25)).tail(6).sum()
+        alt_score = wick_alt / 6
+        
+        # Sub-signal 3: Funding shock proxy
+        avg_vol_48 = df['volume'].rolling(48, min_periods=1).quantile(0.9).iloc[-1]
+        fund_proxy = (latest['volume'] > avg_vol_48) and (abs(latest['close'] - latest['open']) / latest['range'] < 0.3)
+        fund_score = 1.0 if fund_proxy else 0.0
+        
+        # Sub-signal 4: Range compression
+        range_atr = latest['range'] / latest['atr_20']
+        hist_median = (df['range'].rolling(48, min_periods=1).median() / df['atr_20']).iloc[-1]
+        compress_score = 1 - min(range_atr / (hist_median + 1e-6), 1.0)
+        
+        # Composite score
+        self.last_decay_score = (
+            0.35 * vol_score +
+            0.25 * alt_score +
+            0.20 * fund_score +
+            0.20 * compress_score
+        )
+        
+        if self.last_decay_score > 0.65:
+            self.logger.warning(
+                f"SOL decay alert: {self.last_decay_score:.2f} "
+                f"(vol={vol_score:.2f}, alt={alt_score:.2f}, fund={fund_score:.2f}, compress={compress_score:.2f})"
+            )
+
+    def _should_skip_trade(self) -> bool:
+        """Gate function: skip if decay score exceeds threshold"""
+        if not self.enable_decay_filter:
+            return False
+        
+        if self.last_decay_score >= self.decay_threshold:
+            self.logger.info(f"Decay filter ACTIVE (score={self.last_decay_score:.2f}) - skipping event")
+            return True
+        
+        return False
         
     def _setup_logging(self):
         """Configure production logging"""
@@ -111,29 +177,27 @@ class LiveEventDetector:
                 self.logger.error(f"Error processing bar: {e}", exc_info=True)
     
     def _update_metrics(self):
-        """Calculate ATR, wicks, volume metrics (copy-paste from backtest)"""
+        """Calculate ATR, wicks, volume metrics + decay signals"""
         df = pd.DataFrame(list(self.buffer))
         
-        # Core calculations from master_thinning_strategy.py
+        # Existing calculations
         df['range'] = df['high'] - df['low']
         df['upper_wick'] = df['high'] - np.maximum(df['open'], df['close'])
         df['lower_wick'] = np.minimum(df['open'], df['close']) - df['low']
-        
-        # ATR 20-period
         df['atr_20'] = self._calculate_atr(df)
-        
-        # Volume median 50-period
         df['volume_median_50'] = df['volume'].rolling(50, min_periods=1).median()
-        
-        # Wick percentages
         df['upper_wick_pct'] = df['upper_wick'] / df['range']
         df['lower_wick_pct'] = df['lower_wick'] / df['range']
         df['upper_wick_pct'] = df['upper_wick_pct'].replace([np.inf, -np.inf], 0)
         df['lower_wick_pct'] = df['lower_wick_pct'].replace([np.inf, -np.inf], 0)
         
-        # Store in buffer
+        # Update buffer
         for i, (_, row) in enumerate(df.iterrows()):
             self.buffer[i].update(row.to_dict())
+        
+        # NEW: Update decay metrics
+        if len(df) >= 48:
+            self._update_decay_metrics(df.iloc[-1].to_dict())
     
     def _calculate_atr(self, df: pd.DataFrame, period: int = 20) -> pd.Series:
         """ATR calculation from master_thinning_strategy.py"""
@@ -341,11 +405,17 @@ class LiveEventDetector:
             'atr': atr_val,
             'volume': volume_val,
             'direction': direction,
-            'bar': bar_data.to_dict()
+            'bar': bar_data.to_dict(),
+            'decay_score': self.last_decay_score
         }
         
-        # Call callback outside lock to avoid deadlock
-        threading.Thread(target=self.event_callback, args=(event_data,), daemon=True).start()
+        # Call async callback properly from sync context
+        if self.event_callback and asyncio.iscoroutinefunction(self.event_callback):
+            # Schedule async callback on the event loop
+            asyncio.run_coroutine_threadsafe(self.event_callback(event_data), asyncio.get_event_loop())
+        else:
+            # Fallback for sync callbacks
+            threading.Thread(target=self.event_callback, args=(event_data,), daemon=True).start()
     
     def _default_callback(self, event_data: Dict[str, Any]):
         """Default handler - can be overridden"""

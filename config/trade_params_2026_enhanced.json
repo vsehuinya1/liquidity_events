@@ -1,0 +1,15 @@
+{
+  "cooldown_minutes": 12,
+  "max_trades_per_day": 7,
+  "hold_times": [5, 10, 15, 30],
+  "transaction_cost": 0.000075,
+  "stop_loss_atr_mult": 1.5,
+  "take_profit_atr_mult": 4.0,
+  "min_atr": 0.16,
+  "max_atr": 2.0,
+  "trend_filter": true,
+  "volume_confirmation": 1.2,
+  "session_filter": [8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21],
+  "decay_threshold_realtime": 0.75,
+  "decay_threshold_weekly": 0.70
+}
