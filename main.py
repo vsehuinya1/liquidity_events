@@ -13,10 +13,11 @@ import json
 from datetime import datetime
 
 from websocket_handler_improved import BinanceWebSocketFeed
-from live_event_detector import LiveEventDetector
+from strategy_orchestrator import StrategyOrchestrator
 from telegram_bot import TelegramBot
-from trade_executor_paper import PaperTradeExecutor
-from strategy_lifecycle_manager import StrategyLifecycleManager, run_lifecycle_scheduler
+# from live_event_detector import LiveEventDetector # DEPRECATED
+# from trade_executor_paper import PaperTradeExecutor # DEPRECATED
+# from strategy_lifecycle_manager import StrategyLifecycleManager # DEPRECATED
 from config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
 
 class PaperTradingSystem:
@@ -96,50 +97,30 @@ class PaperTradingSystem:
         
         self.running = True
         
-        # 1. Create trade executor with 2026 params
-        self.trade_executor = PaperTradeExecutor(
-            telegram_bot=self.telegram,
-            params_path='config/trade_params_2026_enhanced.json'
+        # 1. Define Active Universe
+        self.active_pairs = ['SOLUSDT', 'ETHUSDT', 'AVAXUSDT', 'DOGEUSDT', 'SUIUSDT'] 
+        self.max_trades = 3
+
+        # 2. Create Strategy Orchestrator (manages the fleet)
+        self.orchestrator = StrategyOrchestrator(
+            symbols=self.active_pairs,
+            max_active_trades=self.max_trades,
+            enable_telegram=True
         )
+        self.telegram = self.orchestrator.telegram # Share the bot instance
+
+        # 3. Create Multi-Pair Feed Handler
+        self.feed_handler = BinanceWebSocketFeed(symbols=self.active_pairs)
         
-        # 2. Create event detector with integrated telegram
-        self.event_detector = LiveEventDetector(
-            event_callback=self.trade_executor.on_event,
-            enable_telegram=True,
-            telegram_bot=self.telegram
-        )
+        # Monkey-patch the resample callback to feed the orchestrator
+        # The orchestrator expects on_bar_update(bar)
+        self.feed_handler.on_5min_bar_callback = self.orchestrator.on_bar_update
         
-        # 3. Create feed handler and connect event detector
-        self.feed_handler = BinanceWebSocketFeed(symbol='SOLUSDT')
-        
-        # Monkey-patch the resample method to feed events
-        original_resample = self.feed_handler._resample_to_5min
-        
-        def enhanced_resample():
-            result = original_resample()
-            
-            # Send new bar to event detector
-            if self.feed_handler.five_min_buffer:
-                latest_bar = self.feed_handler.five_min_buffer[-1]
-                self.event_detector.on_5min_bar(latest_bar)
-            
-            return result
-        
-        self.feed_handler._resample_to_5min = enhanced_resample
-        
-        # 4. Create lifecycle manager and start scheduler
-        self.lifecycle_manager = StrategyLifecycleManager(
-            trade_log_path=self.trade_executor.trade_log_path,
-            telegram_bot=self.telegram
-        )
-        
-        # Start scheduler in background
-        asyncio.create_task(run_lifecycle_scheduler(self.lifecycle_manager))
-        
-        # 5. Start feed handler
+        # 4. Start feed handler
         self.feed_handler.start()
         
         self.logger.info("✓ All components started")
+        self.logger.info(f"✓ Active Universe: {self.active_pairs}")
         self.logger.info("Press Ctrl+C to shutdown gracefully")
         
         # Send startup notification
@@ -181,16 +162,15 @@ class PaperTradingSystem:
             status = self.feed_handler.get_status() if self.feed_handler else {'connected': False}
             
             message = (
-                f"🚀 <b>SOL-PERP v0.5.1 System Online</b>\n"
+                f"🚀 <b>GEM FLEET v1.0.0 Online</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"📊 <b>Status:</b> {'Connected' if status['connected'] else 'Starting'}\n"
                 f"🕐 <b>Time:</b> {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC\n"
-                f"📈 <b>Symbol:</b> SOLUSDT\n"
-                f"⚡ <b>Decay Radar:</b> Active\n"
-                f"🤖 <b>Auto-Corrections:</b> Enabled\n"
-                f"📋 <b>Trade Log:</b> {self.trade_executor.trade_log_path if self.trade_executor else 'N/A'}\n"
+                f"🌎 <b>Universe:</b> {', '.join(self.active_pairs)}\n"
+                f"🛡️ <b>Risk Guard:</b> Max {self.max_trades} Active Trades\n"
+                f"💎 <b>Strategy:</b> Sweep + Cluster + P.Extreme\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"✅ System ready for live market data"
+                f"✅ System ready for multi-pair scanning"
             )
             
             await self.telegram._send_message(message)

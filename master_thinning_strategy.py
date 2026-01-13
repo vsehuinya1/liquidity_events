@@ -11,7 +11,7 @@ warnings.filterwarnings('ignore')
 # Template: liv_eq_oct.py (+9.29 bp result)
 # ============================================================================
 
-DATA_PATH = 'data/parquet/DOGEUSDT_1m.parquet'
+DATA_PATH = 'data/parquet/SOLUSDT_1m.parquet'
 
 print('='*80)
 print('MASTER THINNING STRATEGY - REPRODUCIBLE BASELINE')

@@ -15,39 +15,44 @@ from typing import Dict, List, Optional
 # BINANCE FUTURES WEBSOCKET FEED HANDLER - IMPROVED VERSION
 # Handles SOLUSDT 1-min kline stream with 5-min resampling and hourly saves
 # ============================================================================
-
 class BinanceWebSocketFeed:
     """
-    Production-ready WebSocket feed handler for Binance Futures
-    - Subscribes to 1-minute kline stream
-    - Maintains rolling 100-bar buffers
-    - Resamples to 5-minute bars on-the-fly using bar timestamps
+    Production-ready WebSocket feed handler for Binance Futures (Multi-Pair)
+    - Subscribes to 1-minute kline stream for MULTIPLE symbols
+    - Maintains buffers per symbol
+    - Resamples to 5-minute bars on-the-fly
     - Saves parquet rollover every hour
     - Thread-safe with proper locking
-    - Robust error handling and reconnection
     """
     
-    def __init__(self, symbol='SOLUSDT', buffer_size=100, 
+    def __init__(self, symbols=None, buffer_size=100, 
                  parquet_dir='data/live_buffer', on_5min_bar_callback=None):
-        self.symbol = symbol.lower()
+        if symbols is None:
+            symbols = ['SOLUSDT']
+        if isinstance(symbols, str):
+            symbols = [symbols]
+            
+        self.symbols = [s.lower() for s in symbols]
         self.buffer_size = buffer_size
         self.parquet_dir = parquet_dir
         self.on_5min_bar_callback = on_5min_bar_callback
         
-        # Thread-safe in-memory buffers
-        self.one_min_buffer = deque(maxlen=buffer_size)
-        self.five_min_buffer = deque(maxlen=buffer_size)
+        # Thread-safe in-memory buffers (Dict of Deques)
+        self.one_min_buffers = {s: deque(maxlen=buffer_size) for s in self.symbols}
+        self.five_min_buffers = {s: deque(maxlen=buffer_size) for s in self.symbols}
         
         # WebSocket configuration
-        self.ws_url = f"wss://fstream.binance.com/ws/{self.symbol}@kline_1m"
+        # Construct combined stream URL: symbol@kline_1m/symbol2@kline_1m
+        streams = "/".join([f"{s}@kline_1m" for s in self.symbols])
+        self.ws_url = f"wss://fstream.binance.com/stream?streams={streams}"
         self.ws = None
-        self.reconnect_delay = 5  # seconds
-        self.max_reconnect_delay = 300  # 5 minutes max backoff
+        self.reconnect_delay = 5
+        self.max_reconnect_delay = 300
         self.current_reconnect_delay = self.reconnect_delay
         
-        # Timing trackers - use actual bar timestamps
-        self.last_processed_timestamp = None
-        self.last_5min_bar_timestamp = None
+        # Timing trackers - Per Symbol
+        self.last_5min_bar_timestamps = {s: None for s in self.symbols}
+        self.last_processed_timestamps = {s: None for s in self.symbols}
         self.last_parquet_save = datetime.utcnow()
         
         # State lock for thread safety
@@ -64,7 +69,7 @@ class BinanceWebSocketFeed:
         # Create output directory
         os.makedirs(self.parquet_dir, exist_ok=True)
         
-        logging.info(f"Initialized feed handler for {symbol.upper()}")
+        logging.info(f"Initialized feed handler for {len(self.symbols)} pairs: {', '.join(self.symbols).upper()}")
         
     def _setup_logging(self):
         """Configure production logging"""
@@ -104,31 +109,39 @@ class BinanceWebSocketFeed:
             return False
     
     def on_message(self, ws, message):
-        """Process incoming kline messages"""
+        """Process incoming kline messages from combined stream"""
         try:
-            data = json.loads(message)
+            payload = json.loads(message)
             
             # Handle subscription confirmation
-            if 'result' in data:
-                logging.info(f"Subscription confirmed: {data}")
+            if 'result' in payload:
+                logging.info(f"Subscription confirmed: {payload}")
                 return
+            
+            # Combined stream format: {"stream": "...", "data": {...}}
+            if 'data' not in payload:
+                # Could be direct message if single stream, but we use combined stream url now
+                data = payload
+            else:
+                data = payload['data']
             
             # Extract kline data
             if 'k' not in data:
-                logging.warning(f"Unexpected message format: {message[:200]}")
                 return
                 
             kline = data['k']
+            symbol = kline['s'].lower()
             
             # Validate data before processing
             if not self._validate_kline_data(kline):
-                logging.warning(f"Data validation failed: {kline}")
+                logging.warning(f"Data validation failed for {symbol}")
                 return
             
             # Only process closed klines
             if kline['x']:
                 # Create bar with full Binance payload
                 bar = {
+                    'symbol': symbol.upper(), # Add symbol to bar data
                     'timestamp': pd.to_datetime(kline['t'], unit='ms'),
                     'open': float(kline['o']),
                     'high': float(kline['h']),
@@ -144,23 +157,22 @@ class BinanceWebSocketFeed:
                 
                 # Thread-safe buffer update
                 with self.buffer_lock:
-                    self.one_min_buffer.append(bar)
+                    if symbol in self.one_min_buffers:
+                        self.one_min_buffers[symbol].append(bar)
                 
                 logging.info(
-                    f"1-min bar | {bar['timestamp']} | "
-                    f"O:{bar['open']:.4f} H:{bar['high']:.4f} "
-                    f"L:{bar['low']:.4f} C:{bar['close']:.4f} "
-                    f"V:{bar['volume']:.2f}"
+                    f"{symbol.upper()} 1m | {bar['timestamp']} | "
+                    f"C:{bar['close']:.4f} V:{bar['volume']:.2f}"
                 )
                 
                 # Trigger resample check using bar timestamp
-                self._check_resample(bar['timestamp'])
+                self._check_resample(symbol, bar['timestamp'])
                 
                 # Trigger parquet save check
                 self._check_parquet_save()
                 
                 # Update last processed timestamp
-                self.last_processed_timestamp = bar['timestamp']
+                self.last_processed_timestamps[symbol] = bar['timestamp']
                 
         except json.JSONDecodeError as e:
             logging.error(f"JSON decode error: {e}")
@@ -228,36 +240,39 @@ class BinanceWebSocketFeed:
                 # Start new connection
                 self.start()
                 
-    def _check_resample(self, bar_timestamp):
+                
+    def _check_resample(self, symbol, bar_timestamp):
         """
-        Resample 1-min to 5-min using actual bar timestamps
-        Triggers when we have 5 complete 1-min bars for a 5-min period
+        Resample 1-min to 5-min using actual bar timestamps for specific symbol
         """
         with self.buffer_lock:
-            if not self.one_min_buffer or len(self.one_min_buffer) < 5:
+            buffer = self.one_min_buffers.get(symbol)
+            if not buffer or len(buffer) < 5:
                 return
             
-            # Get the last 5 bars to check if we have a complete 5-min window
-            recent_bars = list(self.one_min_buffer)[-5:]
+            # Get the last 5 bars
+            recent_bars = list(buffer)[-5:]
             
             # Check if these 5 bars cover a complete 5-minute period
             first_ts = recent_bars[0]['timestamp']
             last_ts = recent_bars[-1]['timestamp']
             expected_end_ts = first_ts + timedelta(minutes=4, seconds=59)
             
+            last_5m_ts = self.last_5min_bar_timestamps.get(symbol)
+            
             # If we have a complete 5-min window and it's new
             if (last_ts >= expected_end_ts and 
-                (self.last_5min_bar_timestamp is None or 
-                 last_ts > self.last_5min_bar_timestamp)):
+                (last_5m_ts is None or last_ts > last_5m_ts)):
                 
-                self._resample_to_5min(recent_bars)
-                self.last_5min_bar_timestamp = last_ts
+                self._resample_to_5min(symbol, recent_bars)
+                self.last_5min_bar_timestamps[symbol] = last_ts
                 
-    def _resample_to_5min(self, bars_1m: List[Dict]):
+    def _resample_to_5min(self, symbol, bars_1m: List[Dict]):
         """Perform 5-minute OHLCV resampling from 1-min bars"""
         try:
             # Create 5-min bar from the 1-min bars
             five_min_bar = {
+                'symbol': symbol.upper(),
                 'timestamp': bars_1m[0]['timestamp'],
                 'open': bars_1m[0]['open'],
                 'high': max(b['high'] for b in bars_1m),
@@ -272,13 +287,12 @@ class BinanceWebSocketFeed:
             
             # Thread-safe buffer update
             with self.buffer_lock:
-                self.five_min_buffer.append(five_min_bar)
+                if symbol in self.five_min_buffers:
+                    self.five_min_buffers[symbol].append(five_min_bar)
             
             logging.info(
-                f"5-min bar | {five_min_bar['timestamp']} | "
-                f"O:{five_min_bar['open']:.4f} H:{five_min_bar['high']:.4f} "
-                f"L:{five_min_bar['low']:.4f} C:{five_min_bar['close']:.4f} "
-                f"V:{five_min_bar['volume']:.2f}"
+                f"{symbol.upper()} 5m | {five_min_bar['timestamp']} | "
+                f"C:{five_min_bar['close']:.4f} V:{five_min_bar['volume']:.2f}"
             )
             
             # Call callback if provided
@@ -289,7 +303,7 @@ class BinanceWebSocketFeed:
                     logging.error(f"Callback error: {e}", exc_info=True)
             
         except Exception as e:
-            logging.error(f"Resampling error: {e}", exc_info=True)
+            logging.error(f"Resampling error for {symbol}: {e}", exc_info=True)
             
     def _check_parquet_save(self):
         """Save buffers to parquet every hour"""
@@ -300,37 +314,38 @@ class BinanceWebSocketFeed:
             self.last_parquet_save = current_time
             
     def _save_parquet(self):
-        """Atomic parquet save with error handling"""
+        """Atomic parquet save with error handling for all symbols"""
         try:
             timestamp = datetime.utcnow().strftime('%Y%m%d_%H')
             
-            # Save 1-min buffer
-            if self.one_min_buffer:
+            for symbol in self.symbols:
+                # Save 1-min buffer
                 with self.buffer_lock:
-                    df_1m = pd.DataFrame(self.one_min_buffer)
-                
-                file_path = os.path.join(
-                    self.parquet_dir,
-                    f"{self.symbol}_1m_{timestamp}.parquet"
-                )
-                
-                table = pa.Table.from_pandas(df_1m)
-                pq.write_table(table, file_path)
-                logging.info(f"Saved 1-min parquet: {file_path}")
-                
-            # Save 5-min buffer
-            if self.five_min_buffer:
+                    if symbol in self.one_min_buffers and self.one_min_buffers[symbol]:
+                        df_1m = pd.DataFrame(list(self.one_min_buffers[symbol]))
+                        
+                        file_path = os.path.join(
+                            self.parquet_dir,
+                            f"{symbol.lower()}_1m_{timestamp}.parquet"
+                        )
+                        
+                        table = pa.Table.from_pandas(df_1m)
+                        pq.write_table(table, file_path)
+                        logging.info(f"Saved 1-min parquet: {file_path}")
+                        
+                # Save 5-min buffer
                 with self.buffer_lock:
-                    df_5m = pd.DataFrame(self.five_min_buffer)
-                
-                file_path = os.path.join(
-                    self.parquet_dir,
-                    f"{self.symbol}_5m_{timestamp}.parquet"
-                )
-                
-                table = pa.Table.from_pandas(df_5m)
-                pq.write_table(table, file_path)
-                logging.info(f"Saved 5-min parquet: {file_path}")
+                    if symbol in self.five_min_buffers and self.five_min_buffers[symbol]:
+                        df_5m = pd.DataFrame(list(self.five_min_buffers[symbol]))
+                        
+                        file_path = os.path.join(
+                            self.parquet_dir,
+                            f"{symbol.lower()}_5m_{timestamp}.parquet"
+                        )
+                        
+                        table = pa.Table.from_pandas(df_5m)
+                        pq.write_table(table, file_path)
+                        logging.info(f"Saved 5-min parquet: {file_path}")
                 
         except Exception as e:
             logging.error(f"Parquet save failed: {e}", exc_info=True)
@@ -387,11 +402,11 @@ class BinanceWebSocketFeed:
         logging.info("Feed handler stopped")
         
     def get_buffers(self):
-        """Thread-safe buffer inspection"""
+        """Thread-safe buffer inspection for all symbols"""
         with self.buffer_lock:
             return {
-                'one_min': list(self.one_min_buffer),
-                'five_min': list(self.five_min_buffer)
+                'one_min': {s: list(b) for s, b in self.one_min_buffers.items()},
+                'five_min': {s: list(b) for s, b in self.five_min_buffers.items()}
             }
             
     def get_status(self):
@@ -399,11 +414,7 @@ class BinanceWebSocketFeed:
         buffers = self.get_buffers()
         return {
             'connected': self.is_connected,
-            'symbol': self.symbol.upper(),
-            'one_min_bars': len(buffers['one_min']),
-            'five_min_bars': len(buffers['five_min']),
-            'last_processed': self.last_processed_timestamp,
-            'last_5min_bar': self.last_5min_bar_timestamp,
+            'symbols': [s.upper() for s in self.symbols],
             'last_parquet_save': self.last_parquet_save
         }
 

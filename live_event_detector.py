@@ -11,6 +11,7 @@ import os
 from telegram_bot import TelegramBot
 from collections import deque
 import json
+import time
 
 # ============================================================================
 # LIVE EVENT DETECTOR
@@ -55,7 +56,9 @@ class LiveEventDetector:
         
         # Thread-safe buffers
         self.buffer = deque(maxlen=100)  # 5-min bars with metrics
-        self.pending_thinning_events = []  # Pending confirmations
+        self.pending_thinning_events = []  # Pending thinning confirmations
+        self.pending_cluster_events = []   # Pending cluster confirmations
+        self.pending_sweep_events = []     # Pending sweep confirmations
         self.event_callback = event_callback or self._default_callback
         
         # Decay radar configuration
@@ -90,23 +93,33 @@ class LiveEventDetector:
         latest = df.iloc[-1]
         
         # Sub-signal 1: Micro-volatility surge
-        vol_24h = df['range'].rolling(288, min_periods=1).median().iloc[-1]
-        vol_short = df['range'].rolling(12, min_periods=1).std().iloc[-1]
-        vol_score = min(vol_short / (vol_24h + 1e-6), 1.0)
+        # FIX: Use buffer-appropriate window (max 96 bars, but buffer is 100)
+        vol_baseline = df['range'].rolling(min(len(df), 96), min_periods=20).median().iloc[-1]
+        vol_short = df['range'].tail(12).std()
+        vol_score = min(vol_short / (vol_baseline + 1e-6), 1.0)
         
         # Sub-signal 2: Wick alternation
         wick_alt = ((df['upper_wick_pct'] > 0.25) & (df['lower_wick_pct'].shift() > 0.25)).tail(6).sum()
         alt_score = wick_alt / 6
         
-        # Sub-signal 3: Funding shock proxy
-        avg_vol_48 = df['volume'].rolling(48, min_periods=1).quantile(0.9).iloc[-1]
-        fund_proxy = (latest['volume'] > avg_vol_48) and (abs(latest['close'] - latest['open']) / latest['range'] < 0.3)
-        fund_score = 1.0 if fund_proxy else 0.0
+        # Sub-signal 3: Funding shock proxy (FIXED: graduated instead of binary)
+        avg_vol_48 = df['volume'].rolling(48, min_periods=12).quantile(0.9).iloc[-1]
+        vol_spike = latest['volume'] / (avg_vol_48 + 1e-6)
+        body_ratio = abs(latest['close'] - latest['open']) / (latest['range'] + 1e-6)
         
-        # Sub-signal 4: Range compression
-        range_atr = latest['range'] / latest['atr_20']
-        hist_median = (df['range'].rolling(48, min_periods=1).median() / df['atr_20']).iloc[-1]
-        compress_score = 1 - min(range_atr / (hist_median + 1e-6), 1.0)
+        # Higher score when: high volume + small body (absorption/distribution)
+        if vol_spike > 1.0 and body_ratio < 0.3:
+            fund_score = min((vol_spike - 1.0) * 0.5, 1.0)  # Scale up to 1.0
+        else:
+            fund_score = 0.0
+        
+        # Sub-signal 4: Range compression (FIXED: correct logic)
+        range_atr = latest['range'] / (latest['atr_20'] + 1e-6)
+        hist_ratio = df['range'].tail(48).median() / (df['atr_20'].tail(48).median() + 1e-6)
+        
+        # When range < historical (compressed), ratio < 1, score approaches 1
+        compress_score = max(0, 1 - (range_atr / (hist_ratio + 1e-6)))
+        compress_score = min(compress_score, 1.0)  # Cap at 1.0
         
         # Composite score
         self.last_decay_score = (
@@ -191,13 +204,13 @@ class LiveEventDetector:
         df['upper_wick_pct'] = df['upper_wick_pct'].replace([np.inf, -np.inf], 0)
         df['lower_wick_pct'] = df['lower_wick_pct'].replace([np.inf, -np.inf], 0)
         
-        # Update buffer
+        # Update buffer FIRST
         for i, (_, row) in enumerate(df.iterrows()):
             self.buffer[i].update(row.to_dict())
         
-        # NEW: Update decay metrics
-        if len(df) >= 48:
-            self._update_decay_metrics(df.iloc[-1].to_dict())
+        # THEN update decay metrics with the updated buffer (FIX: timing)
+        if len(self.buffer) >= 48:
+            self._update_decay_metrics(self.buffer[-1])
     
     def _calculate_atr(self, df: pd.DataFrame, period: int = 20) -> pd.Series:
         """ATR calculation from master_thinning_strategy.py"""
@@ -240,7 +253,15 @@ class LiveEventDetector:
         
         if range_condition and volume_condition and wick_condition:
             direction = 'UPPER' if upper_wick_condition else 'LOWER'
-            self._emit_event('liquidity_sweep', current, direction=direction)
+            # ARM the event - sweeps are information, not immediate entries
+            self.pending_sweep_events.append({
+                'bar_idx': i,
+                'direction': direction,
+                'is_upper': upper_wick_condition,
+                'atr': current['atr_20'],
+                'volume': current['volume'],
+                'timestamp': current['timestamp']
+            })
     
     def _detect_liquidation_clusters(self):
         """
@@ -278,8 +299,15 @@ class LiveEventDetector:
         failure_to_extend = current_bar['range'] < cluster_avg_range
         
         if volume_drop and failure_to_extend:
-            direction = 'BULLISH' if bullish_cluster else 'BEARISH'
-            self._emit_event('liquidation_cluster', current_bar, direction=direction)
+            # ARM the event - don't emit yet, wait for confirmation
+            self.pending_cluster_events.append({
+                'bar_idx': i,
+                'direction': 'BULLISH' if bullish_cluster else 'BEARISH',
+                'is_bullish': bullish_cluster,
+                'atr': current_bar['atr_20'],
+                'volume': current_bar['volume'],
+                'timestamp': current_bar['timestamp']
+            })
     
     def _detect_liquidity_thinning(self):
         """
@@ -339,9 +367,71 @@ class LiveEventDetector:
             # Events older than 3 bars are discarded
         
         self.pending_thinning_events = still_pending
+        
+        # NEW: Process pending cluster events
+        still_pending_clusters = []
+        for event in self.pending_cluster_events:
+            bar_idx = event['bar_idx']
+            
+            if current_idx == bar_idx + 1:  # Next bar after exhaustion
+                confirm_bar = df.iloc[current_idx]
+                
+                # Confirm reversal: opposite direction candle
+                if event['is_bullish']:  # Was bullish cluster
+                    # Confirm with bearish candle (close < open)
+                    if confirm_bar['close'] < confirm_bar['open']:
+                        self._emit_event('liquidation_cluster', confirm_bar, direction=event['direction'])
+                        continue  # Confirmed, don't keep
+                else:  # Was bearish cluster
+                    # Confirm with bullish candle (close > open)
+                    if confirm_bar['close'] > confirm_bar['open']:
+                        self._emit_event('liquidation_cluster', confirm_bar, direction=event['direction'])
+                        continue  # Confirmed, don't keep
+                
+                still_pending_clusters.append(event)
+            elif current_idx > bar_idx + 2:  # More than 2 bars old, discard
+                pass
+            else:
+                still_pending_clusters.append(event)
+        
+        self.pending_cluster_events = still_pending_clusters
+        
+        # NEW: Process pending sweep events
+        still_pending_sweeps = []
+        for event in self.pending_sweep_events:
+            bar_idx = event['bar_idx']
+            
+            if current_idx == bar_idx + 1:  # Next bar after sweep
+                confirm_bar = df.iloc[current_idx]
+                
+                # Confirm reversal from the sweep direction
+                if event['is_upper']:  # Was upper wick sweep
+                    # Confirm with bearish follow-through (close < open OR close below sweep bar close)
+                    sweep_bar = df.iloc[bar_idx]
+                    if confirm_bar['close'] < confirm_bar['open'] or confirm_bar['close'] < sweep_bar['close']:
+                        self._emit_event('liquidity_sweep', confirm_bar, direction=event['direction'])
+                        continue  # Confirmed
+                else:  # Was lower wick sweep
+                    # Confirm with bullish follow-through (close > open OR close above sweep bar close)
+                    sweep_bar = df.iloc[bar_idx]
+                    if confirm_bar['close'] > confirm_bar['open'] or confirm_bar['close'] > sweep_bar['close']:
+                        self._emit_event('liquidity_sweep', confirm_bar, direction=event['direction'])
+                        continue  # Confirmed
+                
+                still_pending_sweeps.append(event)
+            elif current_idx > bar_idx + 2:  # More than 2 bars old, discard
+                pass
+            else:
+                still_pending_sweeps.append(event)
+        
+        self.pending_sweep_events = still_pending_sweeps
     
     def _emit_event(self, event_type: str, bar_data: pd.Series, direction: Optional[str] = None):
         """Log and callback for detected events"""
+        # FIX: Check decay filter BEFORE emitting event
+        if self._should_skip_trade():
+            return  # Silently skip when decay score is high
+        
         timestamp = bar_data['timestamp']
         atr_val = bar_data['atr_20']
         volume_val = bar_data['volume']
@@ -362,13 +452,18 @@ class LiveEventDetector:
             elif event_type == 'liquidation_cluster':
                 trade_direction = "SHORT" if direction == "BULLISH" else "LONG"
             elif event_type == 'liquidity_thinning':
-                # For thinning, use recent price action to determine
-                if len(self.buffer) >= 2:
-                    recent_bars = list(self.buffer)[-2:]
-                    if recent_bars[1]['close'] > recent_bars[0]['close']:
-                        trade_direction = "SHORT"  # Fade the move
-                    else:
-                        trade_direction = "LONG"
+                # Trade WITH the wick rejection direction
+                # Upper wick rejection (sellers won) → SHORT
+                # Lower wick rejection (buyers won) → LONG
+                if len(self.buffer) >= 3:
+                    recent_bars = list(self.buffer)[-3:]  # Look at confirming bars
+                    for bar in recent_bars[1:]:  # Skip original expansion bar
+                        if bar.get('upper_wick_pct', 0) >= 0.30:
+                            trade_direction = "SHORT"  # Upper wick rejection
+                            break
+                        elif bar.get('lower_wick_pct', 0) >= 0.30:
+                            trade_direction = "LONG"   # Lower wick rejection
+                            break
             
             # Calculate SL/TP based on ATR (1:3 risk/reward)
             entry_price = bar_data['close']
