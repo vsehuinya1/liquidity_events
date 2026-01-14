@@ -36,15 +36,18 @@ class LiveEventDetectorGem:
         
         # LOCKED PARAMETERS (from backtest)
         self.PARAMS = {
-            'SWEEP_RANGE_MULT': 1.8,
+            'SWEEP_THINNING_MULT': 1.2,
             'SWEEP_WICK_PCT': 0.35,
-            'SWEEP_VOL_MULT': 1.5,
-            'CLUSTER_LEN': 3,
-            'THINNING_ATR_DIST': 1.2,
+            # 'SWEEP_VOL_MULT': 1.5, # Removed
+            'CLUSTER_LEN': 5,
+            # 'THINNING_ATR_DIST': 1.2, # Removed (Moved to sweep eligibility)
+            'COOLDOWN_ATR': 1.5,
             'MAX_BARS_SINCE_CLUSTER': 20,
             'PRIOR_EXTREME_LOOKBACK': 20,
             'ATR_PERIOD': 20,
-            'VOL_MEDIAN_PERIOD': 50
+            'VOL_MEDIAN_PERIOD': 50,
+            'ATR_TRAILING_STOP_MULT': 1.8,
+            'INITIAL_STOP_ATR': 1.0
         }
         
         # Buffers
@@ -121,12 +124,21 @@ class LiveEventDetectorGem:
         # Basic
         df['range'] = df['high'] - df['low']
         
-        # ATR
+        # ATR & TR
         tr1 = df['high'] - df['low']
         tr2 = abs(df['high'] - df['close'].shift())
         tr3 = abs(df['low'] - df['close'].shift())
         tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
         df['atr'] = tr.rolling(self.PARAMS['ATR_PERIOD'], min_periods=1).mean()
+        
+        # Volatility Pocket
+        df['atr_med_20'] = df['atr'].rolling(20, min_periods=1).median()
+        df['atr_slope'] = df['atr'].diff(5)
+        
+        # Cluster Compression Indicators
+        # Mean true range of last 5 vs prior 5
+        df['tr_roll_cluster'] = tr.rolling(5, min_periods=5).mean()
+        df['tr_roll_prior'] = tr.shift(5).rolling(5, min_periods=5).mean()
         
         # Wicks
         df['upper_wick'] = df['high'] - df[['open', 'close']].max(axis=1)
@@ -138,46 +150,40 @@ class LiveEventDetectorGem:
         df['vol_med'] = df['volume'].rolling(self.PARAMS['VOL_MEDIAN_PERIOD'], min_periods=1).median()
         
         # Rolling Extremes (Start of bar)
-        # Note: In backtest we used shift(1) because we are looking at *prior* bars.
-        # df['roll_max_20'] should comprise bars [i-20...i-1].
         df['roll_max_20'] = df['high'].shift(1).rolling(self.PARAMS['PRIOR_EXTREME_LOOKBACK'], min_periods=1).max()
         df['roll_min_20'] = df['low'].shift(1).rolling(self.PARAMS['PRIOR_EXTREME_LOOKBACK'], min_periods=1).min()
 
     def _update_cluster_state(self, df: pd.DataFrame, current_idx: int):
-        """Check for cluster completion at current index"""
-        cluster_len = self.PARAMS['CLUSTER_LEN']
-        if current_idx < cluster_len:
+        """Check for cluster completion at current index using Compression Logic"""
+        # Req 1: Clusters are liquidity loading zones, not momentum.
+        # Mean true range of those bars is ≤ 70% of the mean true range of the prior N bars
+        
+        row = df.iloc[current_idx]
+        tr_cluster = row['tr_roll_cluster']
+        tr_prior = row['tr_roll_prior']
+        
+        if pd.isna(tr_cluster) or pd.isna(tr_prior) or tr_prior == 0:
             return
 
-        cluster = df.iloc[current_idx-cluster_len+1 : current_idx+1] # Includes current bar
-        # Actually backtest used: cluster = df.iloc[i-CLUSTER_LEN:i] where i was current bar.
-        # So it looked at PREVIOUS 3 bars?
-        # Backtest loop: row = df.iloc[i]. cluster = df.iloc[i-CLUSTER_LEN:i].
-        # So if i=50, cluster is 47,48,49. It checks if *previous* 3 bars formed a cluster.
-        # Let's replicate strict timing.
-        
-        prior_cluster_slice = df.iloc[current_idx-cluster_len : current_idx]
-        
-        if len(prior_cluster_slice) < cluster_len:
-            return
+        is_cluster = tr_cluster <= 0.7 * tr_prior
 
-        bull_cluster = (prior_cluster_slice['close'] > prior_cluster_slice['open']).all()
-        bear_cluster = (prior_cluster_slice['close'] < prior_cluster_slice['open']).all()
-
-        if bull_cluster or bear_cluster:
-            self.last_cluster_end_idx = current_idx - 1 # The cluster ended essentially at previous bar
-            # self.logger.info(f"Cluster detected ending at {self.last_cluster_end_idx}")
+        if is_cluster:
+            self.last_cluster_end_idx = current_idx
+            # self.logger.info(f"Compression Cluster detected at {current_idx}")
 
     def _detect_sweep(self, df: pd.DataFrame, current_idx: int):
         row = df.iloc[current_idx]
         
-        # Condition 1: Basic Sweep Metrics
-        is_sweep = (
-            row['range'] > self.PARAMS['SWEEP_RANGE_MULT'] * row['atr'] and
-            row['volume'] > self.PARAMS['SWEEP_VOL_MULT'] * row['vol_med']
-        )
+        # Condition 1: Thinning Eligibility (Req 2) & Volatility Pocket (Req 3)
         
-        if not is_sweep:
+        # 1a. Thinning: Range <= 1.2 * ATR
+        is_thin = row['range'] <= self.PARAMS['SWEEP_THINNING_MULT'] * row['atr']
+        if not is_thin:
+            return
+            
+        # 1b. Volatility Pocket: ATR > Median & Slope > 0
+        is_pocket = (row['atr'] > row['atr_med_20']) and (row['atr_slope'] > 0)
+        if not is_pocket:
             return
 
         # Condition 2: Cluster Precedence (within 20 bars)
@@ -236,12 +242,8 @@ class LiveEventDetectorGem:
             self.logger.info(f"Sweep {pending['bar_idx']} failed confirmation (no reversal)")
             return
 
-        # 2. Thinning Distance Filter
-        # "dist = abs(confirm['close'] - row['close'])"
-        dist = abs(confirm['close'] - sweep['close'])
-        if dist > self.PARAMS['THINNING_ATR_DIST'] * sweep['atr']:
-             self.logger.info(f"Sweep {pending['bar_idx']} filtered by Thinning Distance ({dist:.2f} > limit)")
-             return
+        # 2. Thinning Distance Filter REMOVED (Moved to eligibility)
+        # pass
 
         # 3. SUCCESS - EMIT SIGNAL
         self._emit_signal(confirm, bias, sweep['atr'])
@@ -253,12 +255,17 @@ class LiveEventDetectorGem:
         self.logger.info(f"🚀 SIGNAL CONFIRMED: {direction} at {entry_price} (Time: {timestamp})")
         
         # R:R 3:1 Logic
+        # Trailing Stop Logic
+        # Initial Stop: 1 ATR
+        # Trailing: 1.8 ATR (Handled by bot manager or execution algo?)
+        # For now, we send valid initial params.
+        
         if direction == 'LONG':
-            stop = entry_price - atr
-            target = entry_price + 3 * atr
+            stop = entry_price - self.PARAMS['INITIAL_STOP_ATR'] * atr
+            target = 0 # No fixed target
         else:
-            stop = entry_price + atr
-            target = entry_price - 3 * atr
+            stop = entry_price + self.PARAMS['INITIAL_STOP_ATR'] * atr
+            target = 0
             
         # Telegram Alert
         if self.telegram:
@@ -273,7 +280,8 @@ class LiveEventDetectorGem:
                         stop_loss=stop,
                         take_profit=target,
                         atr=atr,
-                        timestamp=timestamp
+                        timestamp=timestamp,
+                        trailing_stop_atr=self.PARAMS['ATR_TRAILING_STOP_MULT'] # Custom param support needed in bot or ignored
                     )
                 )
             except Exception as e:
