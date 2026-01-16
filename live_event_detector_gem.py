@@ -12,13 +12,13 @@ import os
 from telegram_bot import TelegramBot
 
 # ============================================================================
-# LIVE EVENT DETECTOR GEM
+# LIVE EVENT DETECTOR GEM (v1.1.0)
 # ============================================================================
-# Adjusted logic based on 'sweep_cluster_thinning_backtest.py'
-# - Primary Signal: Confirmed Sweep
-# - Pre-condition: Liquidation Cluster within last 20 bars
-# - Validation: Sweep must break 20-bar prior extreme
-# - Entry Filter: Confirmation candle must not be too far (Thinning Dist)
+# Features:
+# - Sweep + Cluster + Thinning
+# - Sticky Attack Mode (Performance-based)
+# - Aggressive Sizing (1.5x)
+# - Risk Containment (Drawdown Kill, Cooldowns)
 # ============================================================================
 
 class LiveEventDetectorGem:
@@ -27,33 +27,51 @@ class LiveEventDetectorGem:
     - Processes 5-minute bars
     - Tracks Cluster State
     - Detects & Confirms Sweeps
-    - 3:1 R:R Logic
+    - Manages Attack Mode State Machine
     """
     
     def __init__(self, symbol: str, event_callback: Optional[Callable[[Dict[str, Any]], None]] = None, 
                  enable_telegram: bool = True, telegram_bot=None):
         self.symbol = symbol
         
-        # LOCKED PARAMETERS (from backtest)
+        # PARAMETERS (Synced with v1.1.0 Backtest)
         self.PARAMS = {
             'SWEEP_THINNING_MULT': 1.2,
             'SWEEP_WICK_PCT': 0.35,
-            # 'SWEEP_VOL_MULT': 1.5, # Removed
             'CLUSTER_LEN': 5,
-            # 'THINNING_ATR_DIST': 1.2, # Removed (Moved to sweep eligibility)
             'COOLDOWN_ATR': 1.5,
             'MAX_BARS_SINCE_CLUSTER': 20,
             'PRIOR_EXTREME_LOOKBACK': 20,
             'ATR_PERIOD': 20,
             'VOL_MEDIAN_PERIOD': 50,
             'ATR_TRAILING_STOP_MULT': 1.8,
-            'INITIAL_STOP_ATR': 1.0
+            'INITIAL_STOP_ATR': 1.0,
+            
+            # CONTAINMENT
+            'MAX_DRAWDOWN_SESSION_R': 2.0,
+            'MAX_CONSECUTIVE_LOSSES': 2,
+            'COOLDOWN_TRADES': 5,
+            'REGIME_WINDOW': 10
         }
         
         # Buffers
-        self.buffer = deque(maxlen=100)  # Need enough for 50 candle lookback + some buffer
-        self.pending_sweep = None        # Single active sweep waiting for confirmation
-        self.last_cluster_end_idx = -999 # Index of last cluster end
+        self.buffer = deque(maxlen=100)
+        self.pending_sweep = None
+        self.last_cluster_end_idx = -999
+        
+        # ATTACK MODE STATE
+        self.attack_mode_active = False
+        self.losses_in_attack = 0
+        self.attack_session_pnl = 0.0
+        self.cooldown_counter = 0      # Trades remaining in cooldown
+        self.last_trade_pnl = 0.0
+        self.recent_loss = False
+        
+    # Virtual PnL Tracking (for self-containment)
+        # We track signals as "Virtual Trades" to calculate theoretical PnL
+        # and drive the Attack Mode state machine autonomously.
+        self.virtual_trades = [] # List of dicts: {direction, entry, stop, size_mult}
+        self.trade_history = deque(maxlen=20) 
         
         self.event_callback = event_callback or self._default_callback
         
@@ -64,7 +82,7 @@ class LiveEventDetectorGem:
         self.lock = threading.Lock()
         self._setup_logging()
         
-        self.logger.info("LiveEventDetectorGem initialized with Backtest parameters")
+        self.logger.info("LiveEventDetectorGem v1.1.0 initialized (Aggressive + Contained + VirtualTracking)")
 
     def _setup_logging(self):
         log_dir = 'logs'
@@ -72,8 +90,6 @@ class LiveEventDetectorGem:
         self.logger = logging.getLogger(f'LiveEventDetectorGem_{self.symbol}')
         self.logger.setLevel(logging.INFO)
         if not self.logger.handlers:
-            # Use a shared log file for all gems, or separate? Shared is better for correlation view.
-            # actually better to just log to main file but with prefix
             handler = logging.FileHandler(os.path.join(log_dir, 'event_detector_gem.log'))
             handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(name)s: %(message)s'))
             self.logger.addHandler(handler)
@@ -82,14 +98,10 @@ class LiveEventDetectorGem:
         """Ingest new 5-min bar"""
         with self.lock:
             try:
-                # Validation
                 required = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
-                if not all(k in bar for k in required):
-                    return
+                if not all(k in bar for k in required): return
 
                 self.buffer.append(bar)
-                
-                # Need enough history for calculations (50 for vol median, 20 for extremes)
                 if len(self.buffer) > 50:
                     self._process_bar()
                     
@@ -105,38 +117,89 @@ class LiveEventDetectorGem:
         # 1. Update Indicators
         self._calculate_indicators(df)
         
-        # Update row reference after calculation
-        row = df.iloc[-1]
+        # 1.5 Update Virtual Trades (Simulation of PnL)
+        self._manage_virtual_trades(row)
         
-        # 2. Detect Clusters (State Update Only)
+        # 2. Update Attack Mode State (Driven by Virtual PnL)
+        self._manage_attack_mode_state(row)
+        
+        # 3. Detect Clusters
         self._update_cluster_state(df, current_idx)
         
-        # 3. Process Pending Sweep (Confirm/Invalidate)
+        # 4. Process Pending Sweep
         if self.pending_sweep:
             self._check_confirmation(df, self.pending_sweep)
-            self.pending_sweep = None # Reset after checking one bar
+            self.pending_sweep = None
             
-        # 4. Detect New Sweep (Arm Only)
-        # Only check if we didn't just confirm one (implied by execution order)
+        # 5. Detect New Sweep
         self._detect_sweep(df, current_idx)
 
+    def _manage_virtual_trades(self, row: pd.Series):
+        """
+        Simulate trade outcomes (Trailing Stop) for active signals 
+        to generate PnL feedback for state validation.
+        """
+        active = []
+        for trade in self.virtual_trades:
+            # Check Stop Loss
+            pnl_r = 0.0
+            closed = False
+            
+            if trade['direction'] == 'LONG':
+                if row['low'] <= trade['stop']:
+                    # Stopped out
+                    exit_price = trade['stop']
+                    risk = trade['entry'] - trade['initial_stop'] # distance
+                    # R = (Exit - Entry) / Risk_Distance (approx, simplied)
+                    # Actually standard R calculation: (Exit - Entry) / (Entry - InitStop)
+                    # If stops are dynamic, we use ATR basis.
+                    # Simple: (Exit - Entry) / trade['atr']
+                    pnl_r = (exit_price - trade['entry']) / trade['atr']
+                    closed = True
+                else:
+                    # Update Trailing Stop
+                    new_stop = row['close'] - self.PARAMS['ATR_TRAILING_STOP_MULT'] * row['atr']
+                    if new_stop > trade['stop']:
+                        trade['stop'] = new_stop
+                        # self.logger.info(f"Trailing Stop Update (LONG): {new_stop:.2f}")
+            else: # SHORT
+                if row['high'] >= trade['stop']:
+                    # Stopped out
+                    exit_price = trade['stop']
+                    pnl_r = (trade['entry'] - exit_price) / trade['atr']
+                    closed = True
+                else:
+                    # Update Trailing Stop
+                    new_stop = row['close'] + self.PARAMS['ATR_TRAILING_STOP_MULT'] * row['atr']
+                    if new_stop < trade['stop']:
+                        trade['stop'] = new_stop
+                        # self.logger.info(f"Trailing Stop Update (SHORT): {new_stop:.2f}")
+            
+            if closed:
+                # Apply Size Mult
+                final_r = pnl_r * trade['size_mult']
+                self.update_trade_result(final_r) # Update State Machine
+            else:
+                active.append(trade)
+                
+        self.virtual_trades = active
+
     def _calculate_indicators(self, df: pd.DataFrame):
-        # Basic
         df['range'] = df['high'] - df['low']
-        
-        # ATR & TR
-        tr1 = df['high'] - df['low']
-        tr2 = abs(df['high'] - df['close'].shift())
-        tr3 = abs(df['low'] - df['close'].shift())
-        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        tr = pd.concat([
+            df['high'] - df['low'],
+            abs(df['high'] - df['close'].shift()),
+            abs(df['low'] - df['close'].shift())
+        ], axis=1).max(axis=1)
         df['atr'] = tr.rolling(self.PARAMS['ATR_PERIOD'], min_periods=1).mean()
         
         # Volatility Pocket
         df['atr_med_20'] = df['atr'].rolling(20, min_periods=1).median()
         df['atr_slope'] = df['atr'].diff(5)
+        # Note: We don't save 'vol_pocket_active' column, we compute on fly or use column
+        df['vol_pocket_active'] = (df['atr'] > df['atr_med_20']) & (df['atr_slope'] > 0)
         
-        # Cluster Compression Indicators
-        # Mean true range of last 5 vs prior 5
+        # Clusters
         df['tr_roll_cluster'] = tr.rolling(5, min_periods=5).mean()
         df['tr_roll_prior'] = tr.shift(5).rolling(5, min_periods=5).mean()
         
@@ -146,68 +209,74 @@ class LiveEventDetectorGem:
         df['upper_wick_pct'] = df['upper_wick'] / df['range']
         df['lower_wick_pct'] = df['lower_wick'] / df['range']
         
-        # Volume Median
-        df['vol_med'] = df['volume'].rolling(self.PARAMS['VOL_MEDIAN_PERIOD'], min_periods=1).median()
-        
-        # Rolling Extremes (Start of bar)
+        # Extremes
         df['roll_max_20'] = df['high'].shift(1).rolling(self.PARAMS['PRIOR_EXTREME_LOOKBACK'], min_periods=1).max()
         df['roll_min_20'] = df['low'].shift(1).rolling(self.PARAMS['PRIOR_EXTREME_LOOKBACK'], min_periods=1).min()
 
-    def _update_cluster_state(self, df: pd.DataFrame, current_idx: int):
-        """Check for cluster completion at current index using Compression Logic"""
-        # Req 1: Clusters are liquidity loading zones, not momentum.
-        # Mean true range of those bars is ≤ 70% of the mean true range of the prior N bars
+    def _manage_attack_mode_state(self, row: pd.Series):
+        """Update Attack Mode based on Containment Logic"""
         
+        # DAMAGE-BASED INVALIDATION
+        kill_reason = None
+        if self.attack_mode_active:
+            if self.losses_in_attack >= self.PARAMS['MAX_CONSECUTIVE_LOSSES']:
+                kill_reason = "Max Consecutive Losses"
+            elif self.attack_session_pnl <= -self.PARAMS['MAX_DRAWDOWN_SESSION_R']:
+                kill_reason = "Max Session Drawdown"
+            
+            if kill_reason:
+                self.attack_mode_active = False
+                self.cooldown_counter = self.PARAMS['COOLDOWN_TRADES']
+                self.logger.warning(f"[ATTACK KILL] Mode OFF. Reason: {kill_reason}. Cooldown: {self.cooldown_counter} trades.")
+                return
+
+        # ACTIVATION LOGIC
+        if not self.attack_mode_active:
+            if self.cooldown_counter > 0:
+                pass # Still cooling down
+            else:
+                is_pocket = row['vol_pocket_active']
+                if (is_pocket and self.last_trade_pnl >= 0 and not self.recent_loss):
+                    # Regime Governor (Rolling Expectancy)
+                    regime_ok = True
+                    if len(self.trade_history) >= self.PARAMS['REGIME_WINDOW']:
+                        rolling_r = np.mean(list(self.trade_history)[-self.PARAMS['REGIME_WINDOW']:])
+                        if rolling_r < 0:
+                            regime_ok = False
+                            # self.logger.info(f"Regime Block: Rolling R {rolling_r:.2f} < 0")
+                    
+                    if regime_ok:
+                        self.attack_mode_active = True
+                        self.losses_in_attack = 0
+                        self.attack_session_pnl = 0.0
+                        self.logger.info("[ATTACK START] Mode ON! Aggressive Sizing Enabled.")
+
+    def _update_cluster_state(self, df: pd.DataFrame, current_idx: int):
         row = df.iloc[current_idx]
         tr_cluster = row['tr_roll_cluster']
         tr_prior = row['tr_roll_prior']
+        if pd.isna(tr_cluster) or pd.isna(tr_prior) or tr_prior == 0: return
         
-        if pd.isna(tr_cluster) or pd.isna(tr_prior) or tr_prior == 0:
-            return
-
-        is_cluster = tr_cluster <= 0.7 * tr_prior
-
-        if is_cluster:
+        if tr_cluster <= 0.7 * tr_prior:
             self.last_cluster_end_idx = current_idx
-            # self.logger.info(f"Compression Cluster detected at {current_idx}")
 
     def _detect_sweep(self, df: pd.DataFrame, current_idx: int):
         row = df.iloc[current_idx]
         
-        # Condition 1: Thinning Eligibility (Req 2) & Volatility Pocket (Req 3)
+        # 1. Eligibility (Thinning + Pocket)
+        if not (row['range'] <= self.PARAMS['SWEEP_THINNING_MULT'] * row['atr']): return
+        if not ((row['atr'] > row['atr_med_20']) and (row['atr_slope'] > 0)): return
         
-        # 1a. Thinning: Range <= 1.2 * ATR
-        is_thin = row['range'] <= self.PARAMS['SWEEP_THINNING_MULT'] * row['atr']
-        if not is_thin:
-            return
-            
-        # 1b. Volatility Pocket: ATR > Median & Slope > 0
-        is_pocket = (row['atr'] > row['atr_med_20']) and (row['atr_slope'] > 0)
-        if not is_pocket:
-            return
-
-        # Condition 2: Cluster Precedence (within 20 bars)
-        # Note: current_idx counts bars processed. Logic holds.
-        bars_since = current_idx - self.last_cluster_end_idx
-        if bars_since > self.PARAMS['MAX_BARS_SINCE_CLUSTER']:
-            return # Expired or no cluster
-
-        # Condition 3: Prior Extreme Violation
-        prior_max = row['roll_max_20']
-        prior_min = row['roll_min_20']
+        # 2. Cluster Recency
+        if (current_idx - self.last_cluster_end_idx) > self.PARAMS['MAX_BARS_SINCE_CLUSTER']: return
         
+        # 3. Extremes
         active_bias = None
-        
-        # Check Short Sweep (Upper Wick)
         if (row['upper_wick_pct'] > self.PARAMS['SWEEP_WICK_PCT'] and 
-            row['high'] > prior_max and
-            row['close'] < prior_max):
+            row['high'] > row['roll_max_20'] and row['close'] < row['roll_max_20']):
             active_bias = 'SHORT'
-            
-        # Check Long Sweep (Lower Wick)
         elif (row['lower_wick_pct'] > self.PARAMS['SWEEP_WICK_PCT'] and
-              row['low'] < prior_min and 
-              row['close'] > prior_min):
+              row['low'] < row['roll_min_20'] and row['close'] > row['roll_min_20']):
             active_bias = 'LONG'
             
         if active_bias:
@@ -217,94 +286,89 @@ class LiveEventDetectorGem:
                 'sweep_row': row,
                 'atr': row['atr']
             }
-            self.logger.info(f"ARMED SWEEP: {active_bias} at {row['timestamp']} (ATR: {row['atr']:.2f})")
+            self.logger.info(f"ARMED SWEEP: {active_bias} at {row['timestamp']}")
 
     def _check_confirmation(self, df: pd.DataFrame, pending: Dict):
-        """Check next bar for failed continuation + distance filter"""
         current_idx = len(df) - 1
-        
-        # We expect confirmation on the VERY NEXT bar
-        if current_idx != pending['bar_idx'] + 1:
-            return # Should not happen with this periodic logic, but safe guard
-
         confirm = df.iloc[current_idx]
         sweep = pending['sweep_row']
         bias = pending['bias']
         
-        # 1. Failed Continuation
+        # Failed Continuation Check
         failed = False
-        if bias == 'SHORT':
-            failed = confirm['close'] < sweep['close']
-        else:
-            failed = confirm['close'] > sweep['close']
+        if bias == 'SHORT': failed = confirm['close'] < sweep['close']
+        else: failed = confirm['close'] > sweep['close']
             
-        if not failed:
-            self.logger.info(f"Sweep {pending['bar_idx']} failed confirmation (no reversal)")
-            return
-
-        # 2. Thinning Distance Filter REMOVED (Moved to eligibility)
-        # pass
-
-        # 3. SUCCESS - EMIT SIGNAL
-        self._emit_signal(confirm, bias, sweep['atr'])
+        if failed:
+            self._emit_signal(confirm, bias, sweep['atr'])
+        else:
+            self.logger.info(f"Sweep {pending['bar_idx']} failed confirmation.")
 
     def _emit_signal(self, bar: pd.Series, direction: str, atr: float):
         timestamp = bar['timestamp']
         entry_price = bar['close']
         
-        self.logger.info(f"🚀 SIGNAL CONFIRMED: {direction} at {entry_price} (Time: {timestamp})")
-        
-        # R:R 3:1 Logic
-        # Trailing Stop Logic
-        # Initial Stop: 1 ATR
-        # Trailing: 1.8 ATR (Handled by bot manager or execution algo?)
-        # For now, we send valid initial params.
-        
-        if direction == 'LONG':
-            stop = entry_price - self.PARAMS['INITIAL_STOP_ATR'] * atr
-            target = 0 # No fixed target
-        else:
-            stop = entry_price + self.PARAMS['INITIAL_STOP_ATR'] * atr
-            target = 0
+        size_mult = 1.0
+        if self.attack_mode_active:
+            size_mult = 1.5
+            self.logger.info("[AGGRESSIVE] Signal Sizing: 1.5x")
             
-        # Telegram Alert
-        if self.telegram:
-            try:
-                # We spin off a task for async items
-                 asyncio.create_task(
-                    self.telegram.send_entry_alert(
-                        pair=self.symbol,
-                        direction=direction,
-                        entry_price=entry_price,
-                        event_type="GEM_SWEEP", # Distinguish our event
-                        stop_loss=stop,
-                        take_profit=target,
-                        atr=atr,
-                        timestamp=timestamp,
-                        trailing_stop_atr=self.PARAMS['ATR_TRAILING_STOP_MULT'] # Custom param support needed in bot or ignored
-                    )
-                )
-            except Exception as e:
-                self.logger.error(f"Telegram error: {e}")
-
-        # Callback
-        event_data = {
-            'symbol': self.symbol,
-            'timestamp': timestamp,
-            'event_type': 'GEM_SWEEP',
+        if self.cooldown_counter > 0:
+             self.cooldown_counter -= 1 # Decrement cooldown on trade execution attempt
+        
+        self.logger.info(f"🚀 SIGNAL: {direction} @ {entry_price}, Size: {size_mult}x")
+        
+        if direction == 'LONG': stop = entry_price - self.PARAMS['INITIAL_STOP_ATR'] * atr
+        else: stop = entry_price + self.PARAMS['INITIAL_STOP_ATR'] * atr
+        
+        # Track Virtual Trade
+        self.virtual_trades.append({
             'direction': direction,
-            'entry_price': entry_price,
-            'stop_loss': stop,
-            'take_profit': target,
+            'entry': entry_price,
+            'stop': stop,
+            'initial_stop': stop,
             'atr': atr,
-            'volume': bar['volume'],
-            'bar': bar.to_dict()
+            'size_mult': size_mult
+        })
+        
+        if self.telegram:
+            asyncio.create_task(self.telegram.send_entry_alert(
+                pair=self.symbol, direction=direction, entry_price=entry_price, 
+                event_type="GEM_SWEEP", stop_loss=stop, take_profit=0, atr=atr, 
+                timestamp=timestamp, trailing_stop_atr=self.PARAMS['ATR_TRAILING_STOP_MULT']
+            ))
+
+        event_data = {
+            'symbol': self.symbol, 'timestamp': timestamp, 'event_type': 'GEM_SWEEP',
+            'direction': direction, 'entry_price': entry_price, 'stop_loss': stop, 'take_profit': 0,
+            'atr': atr, 'size_multiplier': size_mult, 'volume': bar['volume'], 'bar': bar.to_dict()
         }
         
         if self.event_callback and asyncio.iscoroutinefunction(self.event_callback):
             asyncio.run_coroutine_threadsafe(self.event_callback(event_data), asyncio.get_event_loop())
         else:
             threading.Thread(target=self.event_callback, args=(event_data,), daemon=True).start()
+
+    def update_trade_result(self, pnl_r: float):
+        """
+        CRITICAL: This method must be called by the Execution Engine / Orchestrator
+        when a trade closes, to update the Attack Mode state machine.
+        """
+        with self.lock:
+            self.logger.info(f"Trade Closed. PnL: {pnl_r:.2f}R")
+            self.last_trade_pnl = pnl_r
+            self.recent_loss = (pnl_r < 0)
+            self.trade_history.append(pnl_r)
+            
+            if self.attack_mode_active:
+                self.attack_session_pnl += pnl_r
+                if pnl_r < 0:
+                    self.losses_in_attack += 1
+                else:
+                    self.losses_in_attack = 0 # Reset on win? Or keep cumulative? 
+                    # Backtest logic: losses_in_attack resets on win?
+                    # "Track consecutive losing trades" -> implies reset on win. Yes.
+                    pass
 
     def _default_callback(self, data):
         print(f"[GEM] {data['direction']} Signal at {data['timestamp']}")
