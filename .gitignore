@@ -55,3 +55,4 @@ logs/
 
 # Jupyter Notebook
 .ipynb_checkpoints
+config/secrets.py
