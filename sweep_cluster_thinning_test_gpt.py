@@ -1,12 +1,14 @@
-# sweep_cluster_thinning_backtest.py
-
 import pandas as pd
 import numpy as np
+
+# =============================
+# CONFIG
+# =============================
 
 DATA_PATH = 'data/parquet/SOLUSDT_1m.parquet'
 INITIAL_BALANCE = 10_000
 RISK_PER_TRADE = 0.01
-COST_BP = 1.5  # round-trip
+COST_BP = 1.5
 ATR_PERIOD = 20
 
 # =============================
@@ -29,6 +31,8 @@ tr = pd.concat([
 ], axis=1).max(axis=1)
 
 df['atr'] = tr.rolling(ATR_PERIOD, min_periods=1).mean()
+df['atr_med_20'] = df['atr'].rolling(20, min_periods=1).median()
+df['atr_slope'] = df['atr'].diff(5)
 
 df['upper_wick'] = df['high'] - df[['open', 'close']].max(axis=1)
 df['lower_wick'] = df[['open', 'close']].min(axis=1) - df['low']
@@ -37,35 +41,41 @@ df['lower_wick_pct'] = df['lower_wick'] / df['range']
 
 df['vol_med'] = df['volume'].rolling(50, min_periods=1).median()
 
+df['roll_max_20'] = df['high'].shift(1).rolling(20, min_periods=1).max()
+df['roll_min_20'] = df['low'].shift(1).rolling(20, min_periods=1).min()
+
 # =============================
-# STATE VARIABLES
+# PARAMETERS (STRUCTURAL)
+# =============================
+
+CLUSTER_LEN = 6
+CLUSTER_RANGE_SHRINK = 0.7
+
+SWEEP_RANGE_MULT = 1.8
+SWEEP_VOL_MULT = 1.5
+SWEEP_WICK_PCT = 0.35
+
+THINNING_ATR_MAX = 1.2
+TRAIL_ATR = 1.2
+
+MAX_BARS_SINCE_CLUSTER = 20
+
+# =============================
+# STATE
 # =============================
 
 balance = INITIAL_BALANCE
 trades = []
 
-active_bias = None           # 'LONG' or 'SHORT'
-active_cluster_id = None
+active_bias = None
+last_cluster_idx = -999
 cooldown_until = -1
-cluster_id = 0
-
-# =============================
-# PARAMETERS (LOCKED)
-# =============================
-
-SWEEP_RANGE_MULT = 1.8
-SWEEP_WICK_PCT = 0.35
-SWEEP_VOL_MULT = 1.5
-
-CLUSTER_LEN = 3
-THINNING_ATR_DIST = 1.2
-COOLDOWN_ATR = 1.5
 
 # =============================
 # BACKTEST LOOP
 # =============================
 
-for i in range(50, len(df) - 2):
+for i in range(60, len(df) - 2):
 
     if i < cooldown_until:
         continue
@@ -73,110 +83,111 @@ for i in range(50, len(df) - 2):
     row = df.iloc[i]
 
     # =========================
-    # CLUSTER DETECTION
+    # CLUSTER = RANGE COMPRESSION
     # =========================
-    cluster = df.iloc[i-CLUSTER_LEN:i]
 
-    bull_cluster = (cluster['close'] > cluster['open']).all()
-    bear_cluster = (cluster['close'] < cluster['open']).all()
+    cluster = df.iloc[i - CLUSTER_LEN:i]
+    cluster_range = (cluster['high'] - cluster['low']).mean()
+    prev_range = df.iloc[i - CLUSTER_LEN*2:i - CLUSTER_LEN]['range'].mean()
 
-    if bull_cluster or bear_cluster:
-        cluster_id += 1
-        active_cluster_id = cluster_id
+    if cluster_range < CLUSTER_RANGE_SHRINK * prev_range:
+        last_cluster_idx = i
         active_bias = None
 
     # =========================
-    # SWEEP DETECTION (ARM ONLY)
+    # SWEEP ELIGIBILITY
     # =========================
-    sweep = (
-        row['range'] > SWEEP_RANGE_MULT * row['atr'] and
-        row['volume'] > SWEEP_VOL_MULT * row['vol_med']
-    )
 
-    if sweep:
-        if row['upper_wick_pct'] > SWEEP_WICK_PCT:
-            active_bias = 'SHORT'
-        elif row['lower_wick_pct'] > SWEEP_WICK_PCT:
-            active_bias = 'LONG'
+    if (i - last_cluster_idx) > MAX_BARS_SINCE_CLUSTER:
+        continue
+
+    if row['range'] < SWEEP_RANGE_MULT * row['atr']:
+        continue
+
+    if row['volume'] < SWEEP_VOL_MULT * row['vol_med']:
+        continue
+
+    # ATR pocket gating: early expansion only
+    if not (row['atr'] > row['atr_med_20'] and row['atr_slope'] > 0):
+        continue
 
     # =========================
-    # ENTRY — FAILED CONTINUATION
+    # PRIOR EXTREME VIOLATION + THINNING
     # =========================
+
+    active_bias = None
+
+    if (
+        row['high'] > row['roll_max_20'] and
+        row['close'] < row['roll_max_20'] and
+        row['upper_wick_pct'] > SWEEP_WICK_PCT and
+        row['range'] < THINNING_ATR_MAX * row['atr']
+    ):
+        active_bias = 'SHORT'
+
+    if (
+        row['low'] < row['roll_min_20'] and
+        row['close'] > row['roll_min_20'] and
+        row['lower_wick_pct'] > SWEEP_WICK_PCT and
+        row['range'] < THINNING_ATR_MAX * row['atr']
+    ):
+        active_bias = 'LONG'
+
     if active_bias is None:
         continue
 
+    # =========================
+    # FAILURE CONFIRMATION
+    # =========================
+
     confirm = df.iloc[i + 1]
 
-    if active_bias == 'SHORT':
-        failed = confirm['close'] < row['close']
-    else:
-        failed = confirm['close'] > row['close']
+    if active_bias == 'SHORT' and confirm['close'] >= row['close']:
+        continue
 
-    if not failed:
+    if active_bias == 'LONG' and confirm['close'] <= row['close']:
         continue
 
     # =========================
-    # THINNING FILTER
+    # EXECUTION
     # =========================
-    dist = abs(confirm['close'] - row['close'])
 
-    if dist > THINNING_ATR_DIST * row['atr']:
-        continue
-
-    # =========================
-    # EXECUTE TRADE
-    # =========================
     entry = confirm['close']
     atr = row['atr']
 
     if active_bias == 'LONG':
         stop = entry - atr
-        target = entry + 3 * atr
     else:
         stop = entry + atr
-        target = entry - 3 * atr
 
-    risk_amount = balance * RISK_PER_TRADE
-    position_size = risk_amount / atr
-
+    trailing_stop = stop
     exit_price = None
     R = 0
 
     for j in range(i + 2, len(df)):
-        hi = df.iloc[j]['high']
-        lo = df.iloc[j]['low']
+        bar = df.iloc[j]
 
         if active_bias == 'LONG':
-            if lo <= stop:
-                exit_price = stop
-                R = -1
-                break
-            if hi >= target:
-                exit_price = target
-                R = 3
+            trailing_stop = max(trailing_stop, bar['close'] - TRAIL_ATR * atr)
+            if bar['low'] <= trailing_stop:
+                exit_price = trailing_stop
+                R = (exit_price - entry) / atr
                 break
         else:
-            if hi >= stop:
-                exit_price = stop
-                R = -1
-                break
-            if lo <= target:
-                exit_price = target
-                R = 3
+            trailing_stop = min(trailing_stop, bar['close'] + TRAIL_ATR * atr)
+            if bar['high'] >= trailing_stop:
+                exit_price = trailing_stop
+                R = (entry - exit_price) / atr
                 break
 
     if exit_price is None:
         continue
 
-    cost = COST_BP / 10_000
-    R -= cost
-
+    R -= COST_BP / 10_000
     balance += balance * RISK_PER_TRADE * R
-
     trades.append(R)
 
-    cooldown_until = j + int(COOLDOWN_ATR * atr)
-    active_bias = None
+    cooldown_until = j + int(atr)
 
 # =============================
 # RESULTS
@@ -185,6 +196,7 @@ for i in range(50, len(df) - 2):
 trades = np.array(trades)
 
 print("Trades:", len(trades))
-print("Win rate:", (trades > 0).mean())
-print("Avg R:", trades.mean())
+if len(trades):
+    print("Win rate:", (trades > 0).mean())
+    print("Avg R:", trades.mean())
 print("Final balance:", round(balance, 2))

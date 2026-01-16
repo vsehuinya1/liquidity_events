@@ -40,3 +40,4 @@ The bot includes a paper trading executor that simulates trades without real cap
 ## Version History
 
 - v0.4.0: Paper trading with Telegram alerts
+- v1.1.0: Multi-pair support with global risk containment and improved WebSocket handler

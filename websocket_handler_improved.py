@@ -81,7 +81,7 @@ class BinanceWebSocketFeed:
             format='%(asctime)s [%(levelname)s] %(message)s',
             handlers=[
                 logging.FileHandler(
-                    os.path.join(log_dir, f'feed_handler_{self.symbol}.log')
+                    os.path.join(log_dir, 'feed_handler_multipair.log')
                 ),
                 logging.StreamHandler()
             ]
@@ -218,14 +218,6 @@ class BinanceWebSocketFeed:
         logging.info("WebSocket connection established")
         self.is_connected = True
         self.current_reconnect_delay = self.reconnect_delay  # Reset backoff
-        
-        # Subscribe to kline stream
-        subscribe_msg = {
-            "method": "SUBSCRIBE",
-            "params": [f"{self.symbol}@kline_1m"],
-            "id": 1
-        }
-        ws.send(json.dumps(subscribe_msg))
         
     def _reconnect(self):
         """Safely reconnect WebSocket"""
@@ -369,7 +361,7 @@ class BinanceWebSocketFeed:
             ws_thread = threading.Thread(target=self._run_forever, daemon=True)
             ws_thread.start()
             
-            logging.info(f"Feed handler started for {self.symbol.upper()}")
+            logging.info(f"Feed handler started for {len(self.symbols)} pairs")
             
     def _run_forever(self):
         """WebSocket run loop with keepalive"""
@@ -533,7 +525,7 @@ if __name__ == "__main__":
         print("Starting live WebSocket feed handler...")
         print("Press Ctrl+C to stop gracefully\n")
         
-        feed = BinanceWebSocketFeed(symbol='SOLUSDT')
+        feed = BinanceWebSocketFeed(symbols='SOLUSDT')
         feed.start()
         
         try:

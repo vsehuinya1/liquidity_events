@@ -1,6 +1,6 @@
 # main.py
 """
-SOL-PERP v0.5.1 Main Orchestrator
+SOL-PERP v1.1.0 Main Orchestrator
 Entry point for paper trading with decay management
 """
 
@@ -92,7 +92,7 @@ class PaperTradingSystem:
     async def start(self):
         """Start all components"""
         self.logger.info("=" * 80)
-        self.logger.info("SOL-PERP v0.5.1 PAPER TRADING SYSTEM STARTING")
+        self.logger.info("SOL-PERP v1.1.0 PAPER TRADING SYSTEM STARTING")
         self.logger.info("=" * 80)
         
         self.running = True
@@ -162,7 +162,7 @@ class PaperTradingSystem:
             status = self.feed_handler.get_status() if self.feed_handler else {'connected': False}
             
             message = (
-                f"🚀 <b>GEM FLEET v1.0.0 Online</b>\n"
+                f"🚀 <b>GEM FLEET v1.1.0 Online</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"📊 <b>Status:</b> {'Connected' if status['connected'] else 'Starting'}\n"
                 f"🕐 <b>Time:</b> {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC\n"
