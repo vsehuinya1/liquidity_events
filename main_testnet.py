@@ -18,6 +18,7 @@ from datetime import datetime
 from websocket_handler_improved import BinanceWebSocketFeed
 from strategy_orchestrator import StrategyOrchestrator
 from trade_executor_testnet import TestnetTradeExecutor
+from risk_manager import RiskManager
 from config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
 
 class TestnetVerificationSystem:
@@ -29,6 +30,11 @@ class TestnetVerificationSystem:
         
         self.logger.info("Initializing Testnet Verification System...")
         
+        # 0. Risk Engine (Phase 2)
+        # Loose limits for verification as requested (-100R to allow traffic)
+        # But we want to test Correlation, so Max Correlated = 1 (active)
+        self.risk_manager = RiskManager(daily_loss_limit_r=-100.0, max_active_correlated=1)
+        
         # 1. Initialize Exec Engine
         try:
             self.executor = TestnetTradeExecutor() # Telegram passed later if needed or integrated
@@ -36,13 +42,13 @@ class TestnetVerificationSystem:
             self.logger.error(f"Executor Init Failed: {e}")
             sys.exit(1)
             
-        # 2. Initialize Strategy Orchestrator
-        # We need to hook the orchestrator's output to the executor
-        self.active_pairs = ['SOLUSDT'] # Single pair verification first
-        
+        # 2. Strategy Orchestrator
+        # We need capacity to test correlation (Orchestrator allows > RiskManager blocks)
+        self.active_pairs = ['SOLUSDT'] # Add 'ETHUSDT' etc if testing correlation
+        # Use high max_active to let Orchestrator pass signals to RiskManager
         self.orchestrator = StrategyOrchestrator(
             symbols=self.active_pairs,
-            max_active_trades=1,
+            max_active_trades=10, 
             enable_telegram=True
         )
         
@@ -70,22 +76,21 @@ class TestnetVerificationSystem:
             
             async def hooked_handler(event_data):
                 # 1. Run Original (Risk Checks + Logging + Telegram)
+                # Orchestrator's internal check is mostly for "Total System Risk"
                 await original_handler(event_data)
                 
-                # 2. Forward to Testnet Executor
-                # Note: If Orchestrator blocked it (returned early), we wouldn't know easily 
-                # unless we modify Orchestrator to return success bool.
-                # For Verification, let's assume risk limits are wide open (1 active).
+                # 2. Risk Engine Gatekeeper
+                validated_signal = self.risk_manager.validate_signal(event_data)
                 
-                # Check if Orchestrator approved it? 
-                # StrategyOrchestrator doesn't return value.
-                # Let's just forward it. The Executor has its own checks?
-                # Actually, duplicate execution is bad.
-                # Let's TRUST the orchestrator updates `active_positions`.
+                if validated_signal:
+                     # 3. Forward to Testnet Executor
+                     await self.executor.execute_order(validated_signal)
+                     # 4. Notify Risk Manager of Entry (for correlation bucket)
+                     self.risk_manager.register_entry(validated_signal['symbol'])
+                else:
+                     self.logger.warning(f"⛔ Risk Manager Blocked Signal for {event_data['symbol']}")
                 
-                # Only execute if Orchestrator logged "Approved" (implicitly).
-                # To be robust, let's just execute. Verification is priority.
-                await self.executor.execute_order(event_data)
+            # Replace the callback in the detector
                 
             # Replace the callback in the detector
             # Detector calls `event_callback`.

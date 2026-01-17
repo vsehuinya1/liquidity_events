@@ -85,9 +85,20 @@ class TestnetTradeExecutor:
         Execute trade based on signal.
         signal: {symbol, direction, entry_price, stop_loss, size_multiplier, atr, timestamp}
         """
+        # 1. LATENCY GUARD (3000ms)
         t_received = time.time()
-        t_signal_ts = pd.to_datetime(signal['timestamp']).timestamp()
-        
+        # Parse ISO string to timestamp if needed
+        if isinstance(signal['timestamp'], str):
+             ts_obj = pd.to_datetime(signal['timestamp'])
+             t_signal_ts = ts_obj.timestamp()
+        else:
+             t_signal_ts = signal['timestamp'].timestamp()
+             
+        latency_ms = (t_received - t_signal_ts) * 1000
+        if latency_ms > 3000:
+            self.logger.warning(f"🛑 REJECTED {signal['symbol']}: Latency Guard ({latency_ms:.0f}ms > 3000ms)")
+            return
+
         symbol = signal['symbol']
         direction = signal['direction']
         size_mult = signal.get('size_multiplier', 1.0)
@@ -137,6 +148,25 @@ class TestnetTradeExecutor:
                 closePosition=True
             )
             
+            # 4b. Place HARD STOP (Catastrophic @ 10%)
+            # Independent of Soft Stop. No OCO (since Binance Fut OCO is complex, we just leave it open)
+            # Or better: Just a strict STOP_MARKET that sits there.
+            # If Soft Stop hits, this remains? Ideally cancel.
+            # For verification simplicity: Place it.
+            # Side: same as soft stop. 
+            # Price: Entry +/- 10%
+            hard_dist = fill_price * 0.10
+            hard_price = round(fill_price - hard_dist, 2) if direction == 'LONG' else round(fill_price + hard_dist, 2)
+            
+            hard_stop_order = self.client.futures_create_order(
+                symbol=symbol,
+                side=stop_side,
+                type=Client.ORDER_TYPE_STOP_MARKET,
+                stopPrice=hard_price,
+                closePosition=True
+            )
+            self.logger.info(f"🛡️ HARD STOP Placed @ {hard_price}")
+            
             # 5. Log Metrics
             lat_int = (t_sent - t_received) * 1000
             lat_net = (t_ack - t_sent) * 1000
@@ -152,6 +182,7 @@ class TestnetTradeExecutor:
             self.active_orders[symbol] = {
                 'entry_order_id': order['orderId'],
                 'sl_order_id': sl_order['orderId'],
+                'hard_stop_id': hard_stop_order['orderId'],
                 'direction': direction,
                 'entry_price': fill_price,
                 'quantity': quantity,
