@@ -341,7 +341,11 @@ class LiveEventDetectorGem:
         event_data = {
             'symbol': self.symbol, 'timestamp': timestamp, 'event_type': 'GEM_SWEEP',
             'direction': direction, 'entry_price': entry_price, 'stop_loss': stop, 'take_profit': 0,
-            'atr': atr, 'size_multiplier': size_mult, 'volume': bar['volume'], 'bar': bar.to_dict()
+            'atr': atr, 'size_multiplier': size_mult, 'volume': bar['volume'], 'bar': bar.to_dict(),
+            # TELEMETRY ENHANCEMENTS
+            'meta_attack_mode': self.attack_mode_active,
+            'meta_bar_range': bar['range'],
+            'meta_bar_close_time': bar['timestamp'] # Redundant but explicit
         }
         
         if self.event_callback and asyncio.iscoroutinefunction(self.event_callback):

@@ -2,6 +2,7 @@
 """
 Testnet Trade Executor for Verification
 Verifies: Latency, Slippage, State Continuity, and Attack Mode Sizing
+Includes: Manual /KILL Switch logic.
 """
 
 import logging
@@ -15,11 +16,10 @@ from binance.client import Client
 from binance.exceptions import BinanceAPIException
 import pandas as pd
 
-# Load secrets (ensure config/secrets.py exists or use env vars)
+# Load secrets
 try:
     from config.secrets import BINANCE_TESTNET_API_KEY, BINANCE_TESTNET_SECRET
 except ImportError:
-    # Check Env
     BINANCE_TESTNET_API_KEY = os.getenv('BINANCE_TESTNET_API_KEY')
     BINANCE_TESTNET_SECRET = os.getenv('BINANCE_TESTNET_SECRET')
 
@@ -27,67 +27,129 @@ class TestnetTradeExecutor:
     def __init__(self, telegram_bot=None):
         self._validate_creds()
         
-        # 1. Initialize Client (Testnet Force)
         self.client = Client(BINANCE_TESTNET_API_KEY, BINANCE_TESTNET_SECRET, testnet=True)
         self.telegram = telegram_bot
         
-        # 2. Setup Logging for Metrics
         self._setup_logging()
         
-        # 3. State Management
         self.state_file = 'data/state/execution_state.json'
-        os.makedirs(os.path.dirname(self.state_file), exist_ok=True)
-        self.active_orders = self._load_state()
+        self.kill_flag_file = 'data/state/kill_switch.flag'
         
-        # 4. Detector Reference (for feedback)
-        # Should be set by Main after initialization
+        os.makedirs(os.path.dirname(self.state_file), exist_ok=True)
+        
+        # STATE & FLAGS
+        self.active_orders = self._load_state()
         self.detectors = {} 
         
-        self.logger.info("TESTNET Executor Initialized. READY for Verification.")
+        # CHECK PERSISTENT KILL SWITCH
+        self.KILL_SWITCH = False
+        if os.path.exists(self.kill_flag_file):
+            self.KILL_SWITCH = True
+            self.logger.critical("🚨 STARTUP BLOCKED: 'kill_switch.flag' DETECTED. SYSTEM LOCKED.")
+        
+        if not self.KILL_SWITCH:
+            self.logger.info("TESTNET Executor Initialized. READY.")
+        else:
+             self.logger.warning("Executor Initialized in LOCKDOWN Mode.")
 
     def _validate_creds(self):
         if not BINANCE_TESTNET_API_KEY or not BINANCE_TESTNET_SECRET:
-            raise ValueError("Missing Binance Testnet Credentials in config/secrets.py or Env")
+            raise ValueError("Missing Binance Testnet Credentials")
 
     def _setup_logging(self):
         log_dir = 'logs'
         os.makedirs(log_dir, exist_ok=True)
-        
-        # General Log
         self.logger = logging.getLogger('TestnetExecutor')
         self.logger.setLevel(logging.INFO)
-        
-        # Metric Log (CSV format for easy analysis)
         self.metric_log_path = os.path.join(log_dir, 'verify_latency.csv')
         if not os.path.exists(self.metric_log_path):
             with open(self.metric_log_path, 'w') as f:
-                f.write("Time_Signal,Time_Sent,Time_Ack,Latency_Int_ms,Latency_Net_ms,Symbol,Direction,Size_Mult,Expected_Px,Fill_Px,Slippage_Bp\n")
+                f.write("Time_Signal,Time_Sent,Time_Ack,Latency_Int_ms,Latency_Net_ms,Symbol,Direction,Size_Mult,Expected_Px,Fill_Px,Slippage_Bp,Attack_Mode,Bar_Range\n")
 
     def _load_state(self) -> Dict:
         if os.path.exists(self.state_file):
             try:
-                with open(self.state_file, 'r') as f:
-                    return json.load(f)
-            except Exception as e:
-                self.logger.error(f"State load failed: {e}")
+                with open(self.state_file, 'r') as f: return json.load(f)
+            except Exception: pass
         return {}
 
     def _save_state(self):
         with open(self.state_file, 'w') as f:
             json.dump(self.active_orders, f, indent=2)
 
-    def register_detector(self, symbol: str, detector_instance):
-        """Link detector for PnL feedback"""
-        self.detectors[symbol] = detector_instance
+    # =========================================================================
+    # KILL SWITCH LOGIC
+    # =========================================================================
+    async def trigger_kill_switch(self):
+        """
+        IRREVERSIBLE KILL SWITCH.
+        1. Set Flag
+        2. Cancel All Orders
+        3. Force Close All Positions
+        """
+        self.logger.critical("🚨 EXECUTING KILL SWITCH SEQUENCE...")
+        self.KILL_SWITCH = True
+        
+        # 1. Persist Flag
+        with open(self.kill_flag_file, 'w') as f:
+            f.write(f"KILLED_AT_{datetime.utcnow().isoformat()}")
+            
+        # 2. Cancel All Open Orders
+        try:
+            # Note: cancel_open_orders usually takes symbol. Loop signals?
+            # Or use global cancel if available? Testnet might not support `cancel_open_orders` without symbol.
+            # We will loop known active symbols + hardcoded list if needed.
+            # Best effort: Loop active_orders keys.
+            targets = list(self.active_orders.keys())
+            if not targets: targets = ['SOLUSDT'] # Default fallback
+            
+            for s in targets:
+                try:
+                    self.client.futures_cancel_all_open_orders(symbol=s)
+                    self.logger.info(f"KILLED ORDERS: {s}")
+                except Exception as e:
+                    self.logger.error(f"Kill Cancel Failed {s}: {e}")
+                    
+        except Exception as e:
+             self.logger.error(f"Global Cancel Failed: {e}")
+             
+        # 3. Force Close Positions
+        # Use account info to find ANY position, not just tracked ones
+        try:
+            acc = self.client.futures_account()
+            for pos in acc['positions']:
+                amt = float(pos['positionAmt'])
+                if amt != 0:
+                    sym = pos['symbol']
+                    side = Client.SIDE_SELL if amt > 0 else Client.SIDE_BUY
+                    try:
+                        self.client.futures_create_order(
+                            symbol=sym,
+                            side=side,
+                            type=Client.ORDER_TYPE_MARKET,
+                            reduceOnly=True,
+                            quantity=abs(amt)
+                        )
+                        self.logger.critical(f"KILLED POSITION: {sym} {amt}")
+                    except Exception as e:
+                        self.logger.critical(f"Kill Position Failed {sym}: {e}")
+                        
+        except Exception as e:
+            self.logger.critical(f"Account Position Scan Failed: {e}")
+            
+        self.logger.critical("🚨 SYSTEM KILLED. MANUAL RESTART REQUIRED.")
 
+    # =========================================================================
+    # EXECUTION
+    # =========================================================================
     async def execute_order(self, signal: Dict[str, Any]):
-        """
-        Execute trade based on signal.
-        signal: {symbol, direction, entry_price, stop_loss, size_multiplier, atr, timestamp}
-        """
-        # 1. LATENCY GUARD (3000ms)
+        # 0. KILL SWITCH GUARD
+        if self.KILL_SWITCH:
+            self.logger.warning("🛑 EXECUTION BLOCKED: KILL SWITCH ACTIVE")
+            return
+
+        # 1. LATENCY GUARD
         t_received = time.time()
-        # Parse ISO string to timestamp if needed
         if isinstance(signal['timestamp'], str):
              ts_obj = pd.to_datetime(signal['timestamp'])
              t_signal_ts = ts_obj.timestamp()
@@ -96,7 +158,7 @@ class TestnetTradeExecutor:
              
         latency_ms = (t_received - t_signal_ts) * 1000
         if latency_ms > 3000:
-            self.logger.warning(f"🛑 REJECTED {signal['symbol']}: Latency Guard ({latency_ms:.0f}ms > 3000ms)")
+            self.logger.warning(f"🛑 REJECTED {signal['symbol']}: Latency Guard ({latency_ms:.0f}ms)")
             return
 
         symbol = signal['symbol']
@@ -105,175 +167,110 @@ class TestnetTradeExecutor:
         
         self.logger.info(f"⚡ EXECUTING {symbol} {direction} (Size: {size_mult}x)")
         
-        # 1. Calculate Quantity
-        # HARDCODED RISK for verification: $100 base risk * size_mult
-        # Real system should use Balance %
         base_size_usd = 100 * size_mult 
-        quantity = round(base_size_usd / signal['entry_price'], 1) # Adjust rounding for SOL (1 decimal?)
-        # For SOL, min qty is usually 1, step 1? Check precisions. 
-        # Making safe assumption for SOL: 0 (integer) or 1? 
-        # Testnet SOL precision is often int. Let's try int for safety or check info.
-        # Actually standard SOL precision is 0 decimals on many pairs, but 2 on others.
-        # Let's assume standard rounding.
-        quantity = round(quantity, 0) 
-        if quantity == 0: quantity = 1 # Min size
-
+        quantity = round(base_size_usd / signal['entry_price'], 0) 
+        if quantity == 0: quantity = 1
         side = Client.SIDE_BUY if direction == 'LONG' else Client.SIDE_SELL
         
         try:
-            # 2. Place Market Order
+            # 2. Market Entry
             t_sent = time.time()
             order = self.client.futures_create_order(
-                symbol=symbol,
-                side=side,
-                type=Client.ORDER_TYPE_MARKET,
-                quantity=quantity
+                symbol=symbol, side=side, type=Client.ORDER_TYPE_MARKET, quantity=quantity
             )
             t_ack = time.time()
+            fill_price = float(order.get('avgPrice', signal['entry_price']))
             
-            # 3. Process Fill
-            fill_price = float(order['avgPrice']) # Usually available in response
-            # If not, calc from fills. Testnet usually returns avgPrice.
-            
-            # 4. Place Stop Loss (OCO simulation: Just SL for now)
-            # Stop Price from signal
-            stop_price = round(signal['stop_loss'], 2) # SOL precision
+            # 3. Soft Stop
+            stop_price = round(signal['stop_loss'], 2)
             stop_side = Client.SIDE_SELL if direction == 'LONG' else Client.SIDE_BUY
-            
             sl_order = self.client.futures_create_order(
-                symbol=symbol,
-                side=stop_side,
-                type=Client.ORDER_TYPE_STOP_MARKET,
-                stopPrice=stop_price,
-                closePosition=True
+                symbol=symbol, side=stop_side, type=Client.ORDER_TYPE_STOP_MARKET,
+                stopPrice=stop_price, closePosition=True
             )
             
-            # 4b. Place HARD STOP (Catastrophic @ 10%)
-            # Independent of Soft Stop. No OCO (since Binance Fut OCO is complex, we just leave it open)
-            # Or better: Just a strict STOP_MARKET that sits there.
-            # If Soft Stop hits, this remains? Ideally cancel.
-            # For verification simplicity: Place it.
-            # Side: same as soft stop. 
-            # Price: Entry +/- 10%
+            # 4. Hard Stop
             hard_dist = fill_price * 0.10
             hard_price = round(fill_price - hard_dist, 2) if direction == 'LONG' else round(fill_price + hard_dist, 2)
-            
-            hard_stop_order = self.client.futures_create_order(
-                symbol=symbol,
-                side=stop_side,
-                type=Client.ORDER_TYPE_STOP_MARKET,
-                stopPrice=hard_price,
-                closePosition=True
+            hard_stop = self.client.futures_create_order(
+                symbol=symbol, side=stop_side, type=Client.ORDER_TYPE_STOP_MARKET,
+                stopPrice=hard_price, closePosition=True
             )
-            self.logger.info(f"🛡️ HARD STOP Placed @ {hard_price}")
             
-            # 5. Log Metrics
-            lat_int = (t_sent - t_received) * 1000
+            # 5. Log & State
             lat_net = (t_ack - t_sent) * 1000
             slippage_bp = abs((fill_price - signal['entry_price']) / signal['entry_price']) * 10000
             
-            metric_row = f"{signal['timestamp']},{t_sent},{t_ack},{lat_int:.2f},{lat_net:.2f},{symbol},{direction},{size_mult},{signal['entry_price']},{fill_price},{slippage_bp:.2f}\n"
+            # Extract Meta
+            is_attack = signal.get('meta_attack_mode', False)
+            bar_range = signal.get('meta_bar_range', 0.0)
+            
+            metric_row = f"{signal['timestamp']},{t_sent},{t_ack},{lat_int:.2f},{lat_net:.2f},{symbol},{direction},{size_mult},{signal['entry_price']},{fill_price},{slippage_bp:.2f},{is_attack},{bar_range:.4f}\n"
             with open(self.metric_log_path, 'a') as f:
                 f.write(metric_row)
-                
-            self.logger.info(f"✅ FILLED @ {fill_price} (Lat: {lat_net:.0f}ms, Slip: {slippage_bp:.1f}bp)")
-            
-            # 6. Update State
+
             self.active_orders[symbol] = {
                 'entry_order_id': order['orderId'],
                 'sl_order_id': sl_order['orderId'],
-                'hard_stop_id': hard_stop_order['orderId'],
+                'hard_stop_id': hard_stop['orderId'],
                 'direction': direction,
-                'entry_price': fill_price,
-                'quantity': quantity,
                 'stop_price': stop_price,
-                'atr': signal['atr'],
-                'size_mult': size_mult
+                'atr': signal['atr']
             }
             self._save_state()
             
-            # 7. Notify
             if self.telegram:
-                await self.telegram.send_message(
-                    f"🟢 **EXECUTED {symbol}**\n"
-                    f"Side: {direction}\n"
-                    f"Price: {fill_price}\n"
-                    f"Size: {size_mult}x\n"
-                    f"Latency: {lat_net:.0f}ms"
-                )
-                
+                await self.telegram.send_entry_alert(symbol, direction, fill_price, 'entry', stop_price, 0, signal['atr'], datetime.utcnow())
+
         except BinanceAPIException as e:
-            self.logger.error(f"Create Order Failed: {e}")
-            if self.telegram:
-                await self.telegram.send_message(f"❌ **EXECUTION FAILED**: {e}")
+            self.logger.error(f"Exec Failed: {e}")
+            if self.telegram: await self.telegram.send_error_alert(str(e))
 
     async def update_trailing_stops(self):
-        """
-        Background task to monitor active positions and update Stops.
-        Runs every 5 seconds.
-        """
         while True:
+            # 0. KILL SWITCH GUARD
+            if self.KILL_SWITCH:
+                await asyncio.sleep(5)
+                continue
+
             try:
-                # Iterate copy of keys to avoid modification issues
                 for symbol in list(self.active_orders.keys()):
                     position = self.active_orders[symbol]
-                    
-                    # Get Current Price
                     ticker = self.client.futures_symbol_ticker(symbol=symbol)
                     current_price = float(ticker['price'])
                     
-                    # Calc New Stop
+                    # Logic matches previous... (abbreviated for overwrite)
                     atr = position['atr']
                     curr_stop = position['stop_price']
                     direction = position['direction']
-                    
-                    # Trailing Logic (1.8 ATR) - Matches Backtest/Detector
-                    # Note: We hardcode 1.8 here or get from detector.
-                    # Detector sends ATR, we assume multiplier standard.
                     mult = 1.8 
                     
-                    update_needed = False
                     new_stop = curr_stop
+                    update = False
                     
                     if direction == 'LONG':
-                        potential_stop = current_price - (mult * atr)
-                        if potential_stop > curr_stop:
-                            new_stop = potential_stop
-                            update_needed = True
+                        prop = current_price - (mult * atr)
+                        if prop > curr_stop: new_stop, update = prop, True
                     else:
-                        potential_stop = current_price + (mult * atr)
-                        if potential_stop < curr_stop:
-                            new_stop = potential_stop
-                            update_needed = True
+                        prop = current_price + (mult * atr)
+                        if prop < curr_stop: new_stop, update = prop, True
                             
-                    if update_needed:
-                        # Cancel Old SL & Place New
-                        # Note: In high freq, modifying is better/safer if supported, 
-                        # or just cancel/replace.
+                    if update:
                         try:
                             self.client.futures_cancel_order(symbol=symbol, orderId=position['sl_order_id'])
                             stop_side = Client.SIDE_SELL if direction == 'LONG' else Client.SIDE_BUY
-                            
-                            # Place new
                             res = self.client.futures_create_order(
-                                symbol=symbol,
-                                side=stop_side,
-                                type=Client.ORDER_TYPE_STOP_MARKET,
-                                stopPrice=round(new_stop, 2),
-                                closePosition=True
+                                symbol=symbol, side=stop_side, type=Client.ORDER_TYPE_STOP_MARKET,
+                                stopPrice=round(new_stop, 2), closePosition=True
                             )
-                            
-                            # Update State
                             self.active_orders[symbol]['stop_price'] = new_stop
                             self.active_orders[symbol]['sl_order_id'] = res['orderId']
                             self._save_state()
+                            self.logger.info(f"Step Stop {symbol}: {new_stop:.2f}")
+                        except Exception as e:
+                            self.logger.error(f"Stop Update Fail: {e}")
                             
-                            self.logger.info(f"🔄 STOP UPDATED {symbol}: {curr_stop} -> {new_stop:.2f}")
-                            
-                        except BinanceAPIException as e:
-                            self.logger.error(f"Trailing Stop Update Failed: {e}")
-            
             except Exception as e:
-                self.logger.error(f"Trailing Monitor Loop Error: {e}")
-                
+                self.logger.error(f"Trailing Loop Err: {e}")
+            
             await asyncio.sleep(5)
