@@ -77,6 +77,10 @@ class TestnetTradeExecutor:
         with open(self.state_file, 'w') as f:
             json.dump(self.active_orders, f, indent=2)
 
+    def register_detector(self, symbol: str, detector_instance):
+        """Link detector for PnL feedback"""
+        self.detectors[symbol] = detector_instance
+
     # =========================================================================
     # KILL SWITCH LOGIC
     # =========================================================================
