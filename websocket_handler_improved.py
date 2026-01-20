@@ -1,3 +1,9 @@
+# websocket_handler_improved.py
+"""
+Binance Futures WebSocket Feed Handler - Refactored
+Plumbing only: connect, normalize bars, emit bars
+"""
+
 import websocket
 import json
 import pandas as pd
@@ -7,535 +13,431 @@ from datetime import datetime, timedelta
 import threading
 import time
 import os
-from collections import deque
 import logging
-from typing import Dict, List, Optional
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Callable, Any, Tuple
 
-# ============================================================================
-# BINANCE FUTURES WEBSOCKET FEED HANDLER - IMPROVED VERSION
-# Handles SOLUSDT 1-min kline stream with 5-min resampling and hourly saves
-# ============================================================================
+DEFAULT_BUFFER_SIZE = 100
+DEFAULT_PARQUET_DIR = 'data/live_buffer'
+RECONNECT_DELAY_INITIAL_SEC = 5
+RECONNECT_DELAY_MAX_SEC = 300
+PING_INTERVAL_SEC = 60
+PING_TIMEOUT_SEC = 10
+PARQUET_SAVE_INTERVAL_HOURS = 1
+REQUIRED_KLINE_FIELDS = ('t', 'o', 'h', 'l', 'c', 'v', 'n', 'q', 'V', 'Q', 'x')
+
+
+@dataclass
+class WebSocketState:
+    connected: bool = False
+    running: bool = False
+    reconnect_attempts: int = 0
+    current_reconnect_delay: float = RECONNECT_DELAY_INITIAL_SEC
+    last_parquet_save: datetime = field(default_factory=datetime.utcnow)
+    last_bar_timestamps: Dict[str, Optional[int]] = field(default_factory=dict)
+
+
+def parse_raw_message(raw_message: str) -> Optional[Dict[str, Any]]:
+    try:
+        return json.loads(raw_message)
+    except json.JSONDecodeError:
+        return None
+
+
+def extract_kline_from_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if 'result' in payload:
+        return None
+    if 'data' in payload:
+        data = payload['data']
+    else:
+        data = payload
+    if 'k' not in data:
+        return None
+    return data['k']
+
+
+def extract_symbol_from_kline(kline: Dict[str, Any]) -> str:
+    return kline.get('s', '').lower()
+
+
+def validate_kline_fields(kline: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
+    for field_name in REQUIRED_KLINE_FIELDS:
+        if field_name not in kline:
+            return False, f"Missing required field: {field_name}"
+    return True, None
+
+
+def validate_kline_numerics(kline: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
+    try:
+        float(kline['o'])
+        float(kline['h'])
+        float(kline['l'])
+        float(kline['c'])
+        float(kline['v'])
+        return True, None
+    except (ValueError, TypeError) as e:
+        return False, f"Invalid numeric format: {e}"
+
+
+def validate_bar_integrity(open_price: float, high_price: float, low_price: float, close_price: float, volume: float) -> Tuple[bool, Optional[str]]:
+    if high_price < low_price:
+        return False, f"Invalid OHLC: high ({high_price}) < low ({low_price})"
+    bar_range = high_price - low_price
+    if volume == 0 and bar_range > 0:
+        return False, f"Zero volume with nonzero range ({bar_range})"
+    return True, None
+
+
+def is_new_bar(bar_timestamp_ms: int, last_bar_timestamp_ms: Optional[int]) -> bool:
+    if last_bar_timestamp_ms is None:
+        return True
+    return bar_timestamp_ms > last_bar_timestamp_ms
+
+
+def is_bar_closed(kline: Dict[str, Any]) -> bool:
+    return bool(kline.get('x', False))
+
+
+def extract_ohlcv_bar(kline: Dict[str, Any], symbol: str) -> Dict[str, Any]:
+    return {
+        'symbol': symbol.upper(),
+        'timestamp': pd.to_datetime(kline['t'], unit='ms'),
+        'timestamp_ms': int(kline['t']),
+        'open': float(kline['o']),
+        'high': float(kline['h']),
+        'low': float(kline['l']),
+        'close': float(kline['c']),
+        'volume': float(kline['v']),
+        'n_trades': int(kline['n']),
+        'quote_volume': float(kline['q']),
+        'taker_buy_base': float(kline['V']),
+        'taker_buy_quote': float(kline['Q']),
+        'is_closed': bool(kline['x'])
+    }
+
+
+def can_resample_5min(buffer_length: int, first_bar_ts: datetime, last_bar_ts: datetime, last_5min_ts: Optional[datetime]) -> bool:
+    if buffer_length < 5:
+        return False
+    expected_end = first_bar_ts + timedelta(minutes=4, seconds=59)
+    if last_bar_ts < expected_end:
+        return False
+    if last_5min_ts is not None and last_bar_ts <= last_5min_ts:
+        return False
+    return True
+
+
+def resample_bars_to_5min(bars_1m: List[Dict[str, Any]], symbol: str) -> Dict[str, Any]:
+    return {
+        'symbol': symbol.upper(),
+        'timestamp': bars_1m[0]['timestamp'],
+        'open': bars_1m[0]['open'],
+        'high': max(b['high'] for b in bars_1m),
+        'low': min(b['low'] for b in bars_1m),
+        'close': bars_1m[-1]['close'],
+        'volume': sum(b['volume'] for b in bars_1m),
+        'n_trades': sum(b['n_trades'] for b in bars_1m),
+        'quote_volume': sum(b['quote_volume'] for b in bars_1m),
+        'taker_buy_base': sum(b['taker_buy_base'] for b in bars_1m),
+        'taker_buy_quote': sum(b['taker_buy_quote'] for b in bars_1m)
+    }
+
+
+def build_stream_url(symbols: List[str]) -> str:
+    streams = "/".join([f"{s}@kline_1m" for s in symbols])
+    return f"wss://fstream.binance.com/stream?streams={streams}"
+
+
+def setup_feed_logging() -> logging.Logger:
+    log_dir = 'logs'
+    os.makedirs(log_dir, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        handlers=[
+            logging.FileHandler(os.path.join(log_dir, 'feed_handler_multipair.log')),
+            logging.StreamHandler()
+        ]
+    )
+    return logging.getLogger('WebSocketFeed')
+
+
 class BinanceWebSocketFeed:
-    """
-    Production-ready WebSocket feed handler for Binance Futures (Multi-Pair)
-    - Subscribes to 1-minute kline stream for MULTIPLE symbols
-    - Maintains buffers per symbol
-    - Resamples to 5-minute bars on-the-fly
-    - Saves parquet rollover every hour
-    - Thread-safe with proper locking
-    """
-    
-    def __init__(self, symbols=None, buffer_size=100, 
-                 parquet_dir='data/live_buffer', on_5min_bar_callback=None):
+    def __init__(self, symbols: Optional[List[str]] = None, buffer_size: int = DEFAULT_BUFFER_SIZE, parquet_dir: str = DEFAULT_PARQUET_DIR, on_5min_bar_callback: Optional[Callable[[Dict[str, Any]], None]] = None):
         if symbols is None:
             symbols = ['SOLUSDT']
         if isinstance(symbols, str):
             symbols = [symbols]
-            
         self.symbols = [s.lower() for s in symbols]
         self.buffer_size = buffer_size
         self.parquet_dir = parquet_dir
         self.on_5min_bar_callback = on_5min_bar_callback
-        
-        # Thread-safe in-memory buffers (Dict of Deques)
-        self.one_min_buffers = {s: deque(maxlen=buffer_size) for s in self.symbols}
-        self.five_min_buffers = {s: deque(maxlen=buffer_size) for s in self.symbols}
-        
-        # WebSocket configuration
-        # Construct combined stream URL: symbol@kline_1m/symbol2@kline_1m
-        streams = "/".join([f"{s}@kline_1m" for s in self.symbols])
-        self.ws_url = f"wss://fstream.binance.com/stream?streams={streams}"
-        self.ws = None
-        self.reconnect_delay = 5
-        self.max_reconnect_delay = 300
-        self.current_reconnect_delay = self.reconnect_delay
-        
-        # Timing trackers - Per Symbol
-        self.last_5min_bar_timestamps = {s: None for s in self.symbols}
-        self.last_processed_timestamps = {s: None for s in self.symbols}
-        self.last_parquet_save = datetime.utcnow()
-        
-        # State lock for thread safety
+        self.ws_url = build_stream_url(self.symbols)
+        self.ws: Optional[websocket.WebSocketApp] = None
+        self.state = WebSocketState(last_bar_timestamps={s: None for s in self.symbols})
+        self.one_min_buffers: Dict[str, deque] = {s: deque(maxlen=buffer_size) for s in self.symbols}
+        self.five_min_buffers: Dict[str, deque] = {s: deque(maxlen=buffer_size) for s in self.symbols}
+        self.last_5min_bar_timestamps: Dict[str, Optional[datetime]] = {s: None for s in self.symbols}
         self.buffer_lock = threading.Lock()
         self.ws_lock = threading.Lock()
-        
-        # Connection state
-        self.is_connected = False
-        self.shutdown_flag = False
-        
-        # Setup logging
-        self._setup_logging()
-        
-        # Create output directory
+        self.logger = setup_feed_logging()
         os.makedirs(self.parquet_dir, exist_ok=True)
-        
-        logging.info(f"Initialized feed handler for {len(self.symbols)} pairs: {', '.join(self.symbols).upper()}")
-        
-    def _setup_logging(self):
-        """Configure production logging"""
-        log_dir = 'logs'
-        os.makedirs(log_dir, exist_ok=True)
-        
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s [%(levelname)s] %(message)s',
-            handlers=[
-                logging.FileHandler(
-                    os.path.join(log_dir, 'feed_handler_multipair.log')
-                ),
-                logging.StreamHandler()
-            ]
-        )
+        self.logger.info(f"Initialized feed handler for {len(self.symbols)} pairs: {', '.join(self.symbols).upper()}")
+
+    @property
+    def is_connected(self) -> bool:
+        return self.state.connected
     
-    def _validate_kline_data(self, kline: Dict) -> bool:
-        """Validate incoming kline data"""
-        required_fields = ['t', 'o', 'h', 'l', 'c', 'v', 'n', 'q', 'V', 'Q', 'x']
-        try:
-            for field in required_fields:
-                if field not in kline:
-                    logging.warning(f"Missing required field: {field}")
-                    return False
-            
-            # Validate numeric fields
-            float(kline['o'])
-            float(kline['h'])
-            float(kline['l'])
-            float(kline['c'])
-            float(kline['v'])
-            
-            return True
-        except (ValueError, TypeError) as e:
-            logging.warning(f"Invalid data format: {e}")
-            return False
+    @is_connected.setter
+    def is_connected(self, value: bool) -> None:
+        self.state.connected = value
     
-    def on_message(self, ws, message):
-        """Process incoming kline messages from combined stream"""
-        try:
-            payload = json.loads(message)
-            
-            # Handle subscription confirmation
-            if 'result' in payload:
-                logging.info(f"Subscription confirmed: {payload}")
-                return
-            
-            # Combined stream format: {"stream": "...", "data": {...}}
-            if 'data' not in payload:
-                # Could be direct message if single stream, but we use combined stream url now
-                data = payload
-            else:
-                data = payload['data']
-            
-            # Extract kline data
-            if 'k' not in data:
-                return
-                
-            kline = data['k']
-            symbol = kline['s'].lower()
-            
-            # Validate data before processing
-            if not self._validate_kline_data(kline):
-                logging.warning(f"Data validation failed for {symbol}")
-                return
-            
-            # Only process closed klines
-            if kline['x']:
-                # Create bar with full Binance payload
-                bar = {
-                    'symbol': symbol.upper(), # Add symbol to bar data
-                    'timestamp': pd.to_datetime(kline['t'], unit='ms'),
-                    'open': float(kline['o']),
-                    'high': float(kline['h']),
-                    'low': float(kline['l']),
-                    'close': float(kline['c']),
-                    'volume': float(kline['v']),
-                    'n_trades': int(kline['n']),
-                    'quote_volume': float(kline['q']),
-                    'taker_buy_base': float(kline['V']),
-                    'taker_buy_quote': float(kline['Q']),
-                    'is_closed': bool(kline['x'])
-                }
-                
-                # Thread-safe buffer update
-                with self.buffer_lock:
-                    if symbol in self.one_min_buffers:
-                        self.one_min_buffers[symbol].append(bar)
-                
-                logging.info(
-                    f"{symbol.upper()} 1m | {bar['timestamp']} | "
-                    f"C:{bar['close']:.4f} V:{bar['volume']:.2f}"
-                )
-                
-                # Trigger resample check using bar timestamp
-                self._check_resample(symbol, bar['timestamp'])
-                
-                # Trigger parquet save check
-                self._check_parquet_save()
-                
-                # Update last processed timestamp
-                self.last_processed_timestamps[symbol] = bar['timestamp']
-                
-        except json.JSONDecodeError as e:
-            logging.error(f"JSON decode error: {e}")
-            logging.error(f"Raw message: {message[:200]}")
-        except Exception as e:
-            logging.error(f"Message processing error: {e}", exc_info=True)
-            logging.error(f"Raw message: {message[:200]}")
-            
-    def on_error(self, ws, error):
-        """Handle WebSocket errors with exponential backoff"""
-        logging.error(f"WebSocket error: {error}")
-        self.is_connected = False
-        
-        # Don't attempt reconnection if shutting down
-        if self.shutdown_flag:
-            return
-            
-        # Exponential backoff
-        logging.info(f"Attempting reconnection in {self.current_reconnect_delay}s...")
-        time.sleep(self.current_reconnect_delay)
-        
-        # Increase delay for next time, up to max
-        self.current_reconnect_delay = min(
-            self.current_reconnect_delay * 2,
-            self.max_reconnect_delay
-        )
-        
-        self._reconnect()
-        
-    def on_close(self, ws, close_status_code, close_msg):
-        """Handle WebSocket close"""
-        logging.warning(
-            f"WebSocket closed: {close_status_code} - {close_msg}"
-        )
-        self.is_connected = False
-        
-        # Attempt reconnection if not shutting down
-        if not self.shutdown_flag:
-            self._reconnect()
-            
-    def on_open(self, ws):
-        """Handle WebSocket open"""
-        logging.info("WebSocket connection established")
-        self.is_connected = True
-        self.current_reconnect_delay = self.reconnect_delay  # Reset backoff
-        
-    def _reconnect(self):
-        """Safely reconnect WebSocket"""
+    @property
+    def shutdown_flag(self) -> bool:
+        return not self.state.running
+    
+    @shutdown_flag.setter
+    def shutdown_flag(self, value: bool) -> None:
+        self.state.running = not value
+    
+    @property
+    def last_parquet_save(self) -> datetime:
+        return self.state.last_parquet_save
+    
+    @last_parquet_save.setter
+    def last_parquet_save(self, value: datetime) -> None:
+        self.state.last_parquet_save = value
+    
+    @property
+    def reconnect_delay(self) -> float:
+        return RECONNECT_DELAY_INITIAL_SEC
+    
+    @property
+    def max_reconnect_delay(self) -> float:
+        return RECONNECT_DELAY_MAX_SEC
+    
+    @property
+    def current_reconnect_delay(self) -> float:
+        return self.state.current_reconnect_delay
+    
+    @current_reconnect_delay.setter
+    def current_reconnect_delay(self, value: float) -> None:
+        self.state.current_reconnect_delay = value
+
+    def start(self) -> None:
         with self.ws_lock:
-            if self.ws and not self.shutdown_flag:
-                logging.info("Reconnecting WebSocket...")
-                # Close existing connection if any
+            if self.ws and self.state.connected:
+                self.logger.warning("WebSocket already running")
+                return
+            self.state.running = True
+            self.ws = websocket.WebSocketApp(self.ws_url, on_open=self._on_open, on_message=self._on_message, on_error=self._on_error, on_close=self._on_close)
+            ws_thread = threading.Thread(target=self._run_forever, daemon=True)
+            ws_thread.start()
+            self.logger.info(f"Feed handler started for {len(self.symbols)} pairs")
+
+    def stop(self) -> None:
+        self.logger.info("Stopping feed handler...")
+        self.state.running = False
+        self.state.connected = False
+        if self.ws:
+            try:
+                self.ws.close()
+            except Exception:
+                pass
+        self._save_parquet()
+        self.logger.info("Feed handler stopped")
+
+    def reconnect(self) -> None:
+        with self.ws_lock:
+            if not self.state.running:
+                return
+            self.logger.info("Reconnecting WebSocket...")
+            self.state.reconnect_attempts += 1
+            if self.ws:
                 try:
                     self.ws.close()
-                except:
+                except Exception:
                     pass
-                # Start new connection
-                self.start()
-                
-                
-    def _check_resample(self, symbol, bar_timestamp):
-        """
-        Resample 1-min to 5-min using actual bar timestamps for specific symbol
-        """
+            self.start()
+
+    def _on_open(self, ws) -> None:
+        self.logger.info("WebSocket connection established")
+        self.state.connected = True
+        self.state.current_reconnect_delay = RECONNECT_DELAY_INITIAL_SEC
+        self.state.reconnect_attempts = 0
+
+    def _on_close(self, ws, close_status_code, close_msg) -> None:
+        self.logger.warning(f"WebSocket closed: {close_status_code} - {close_msg}")
+        self.state.connected = False
+        if self.state.running:
+            self.reconnect()
+
+    def _on_error(self, ws, error) -> None:
+        self.logger.error(f"WebSocket error: {error}")
+        self.state.connected = False
+        if not self.state.running:
+            return
+        self.logger.info(f"Attempting reconnection in {self.state.current_reconnect_delay}s...")
+        time.sleep(self.state.current_reconnect_delay)
+        self.state.current_reconnect_delay = min(self.state.current_reconnect_delay * 2, RECONNECT_DELAY_MAX_SEC)
+        self.reconnect()
+
+    def _on_message(self, ws, message: str) -> None:
+        payload = parse_raw_message(message)
+        if payload is None:
+            self.logger.error(f"JSON decode error. Raw: {message[:200]}")
+            return
+        kline = extract_kline_from_payload(payload)
+        if kline is None:
+            if 'result' in payload:
+                self.logger.info(f"Subscription confirmed: {payload}")
+            return
+        symbol = extract_symbol_from_kline(kline)
+        if symbol not in self.symbols:
+            return
+        is_valid, error = validate_kline_fields(kline)
+        if not is_valid:
+            self.logger.warning(f"Field validation failed for {symbol}: {error}")
+            return
+        is_valid, error = validate_kline_numerics(kline)
+        if not is_valid:
+            self.logger.warning(f"Numeric validation failed for {symbol}: {error}")
+            return
+        if not is_bar_closed(kline):
+            return
+        bar_timestamp_ms = int(kline['t'])
+        last_timestamp_ms = self.state.last_bar_timestamps.get(symbol)
+        if not is_new_bar(bar_timestamp_ms, last_timestamp_ms):
+            self.logger.debug(f"Dropped duplicate/old bar for {symbol}: ts={bar_timestamp_ms}, last={last_timestamp_ms}")
+            return
+        bar = extract_ohlcv_bar(kline, symbol)
+        is_valid, error = validate_bar_integrity(bar['open'], bar['high'], bar['low'], bar['close'], bar['volume'])
+        if not is_valid:
+            self.logger.warning(f"Bar integrity failed for {symbol}: {error}")
+            return
+        self.state.last_bar_timestamps[symbol] = bar_timestamp_ms
+        with self.buffer_lock:
+            self.one_min_buffers[symbol].append(bar)
+        self.logger.info(f"{symbol.upper()} 1m | {bar['timestamp']} | C:{bar['close']:.4f} V:{bar['volume']:.2f}")
+        self._try_resample(symbol, bar['timestamp'])
+        self._check_parquet_save()
+
+    def _run_forever(self) -> None:
+        while self.state.running:
+            try:
+                if self.ws:
+                    self.ws.run_forever(ping_interval=PING_INTERVAL_SEC, ping_timeout=PING_TIMEOUT_SEC)
+            except Exception as e:
+                self.logger.error(f"WebSocket run_forever error: {e}", exc_info=True)
+                if self.state.running:
+                    time.sleep(RECONNECT_DELAY_INITIAL_SEC)
+
+    def _try_resample(self, symbol: str, bar_timestamp: datetime) -> None:
         with self.buffer_lock:
             buffer = self.one_min_buffers.get(symbol)
             if not buffer or len(buffer) < 5:
                 return
-            
-            # Get the last 5 bars
             recent_bars = list(buffer)[-5:]
-            
-            # Check if these 5 bars cover a complete 5-minute period
             first_ts = recent_bars[0]['timestamp']
             last_ts = recent_bars[-1]['timestamp']
-            expected_end_ts = first_ts + timedelta(minutes=4, seconds=59)
-            
             last_5m_ts = self.last_5min_bar_timestamps.get(symbol)
-            
-            # If we have a complete 5-min window and it's new
-            if (last_ts >= expected_end_ts and 
-                (last_5m_ts is None or last_ts > last_5m_ts)):
-                
-                self._resample_to_5min(symbol, recent_bars)
-                self.last_5min_bar_timestamps[symbol] = last_ts
-                
-    def _resample_to_5min(self, symbol, bars_1m: List[Dict]):
-        """Perform 5-minute OHLCV resampling from 1-min bars"""
-        try:
-            # Create 5-min bar from the 1-min bars
-            five_min_bar = {
-                'symbol': symbol.upper(),
-                'timestamp': bars_1m[0]['timestamp'],
-                'open': bars_1m[0]['open'],
-                'high': max(b['high'] for b in bars_1m),
-                'low': min(b['low'] for b in bars_1m),
-                'close': bars_1m[-1]['close'],
-                'volume': sum(b['volume'] for b in bars_1m),
-                'n_trades': sum(b['n_trades'] for b in bars_1m),
-                'quote_volume': sum(b['quote_volume'] for b in bars_1m),
-                'taker_buy_base': sum(b['taker_buy_base'] for b in bars_1m),
-                'taker_buy_quote': sum(b['taker_buy_quote'] for b in bars_1m)
-            }
-            
-            # Thread-safe buffer update
-            with self.buffer_lock:
-                if symbol in self.five_min_buffers:
-                    self.five_min_buffers[symbol].append(five_min_bar)
-            
-            logging.info(
-                f"{symbol.upper()} 5m | {five_min_bar['timestamp']} | "
-                f"C:{five_min_bar['close']:.4f} V:{five_min_bar['volume']:.2f}"
-            )
-            
-            # Call callback if provided
-            if self.on_5min_bar_callback:
-                try:
-                    self.on_5min_bar_callback(five_min_bar)
-                except Exception as e:
-                    logging.error(f"Callback error: {e}", exc_info=True)
-            
-        except Exception as e:
-            logging.error(f"Resampling error for {symbol}: {e}", exc_info=True)
-            
-    def _check_parquet_save(self):
-        """Save buffers to parquet every hour"""
+            if not can_resample_5min(len(recent_bars), first_ts, last_ts, last_5m_ts):
+                return
+            five_min_bar = resample_bars_to_5min(recent_bars, symbol)
+            self.five_min_buffers[symbol].append(five_min_bar)
+            self.last_5min_bar_timestamps[symbol] = last_ts
+        self.logger.info(f"{symbol.upper()} 5m | {five_min_bar['timestamp']} | C:{five_min_bar['close']:.4f} V:{five_min_bar['volume']:.2f}")
+        if self.on_5min_bar_callback:
+            try:
+                self.on_5min_bar_callback(five_min_bar)
+            except Exception as e:
+                self.logger.error(f"Callback error: {e}", exc_info=True)
+
+    def _check_parquet_save(self) -> None:
         current_time = datetime.utcnow()
-        
-        if current_time >= self.last_parquet_save + timedelta(hours=1):
+        if current_time >= self.state.last_parquet_save + timedelta(hours=PARQUET_SAVE_INTERVAL_HOURS):
             self._save_parquet()
-            self.last_parquet_save = current_time
-            
-    def _save_parquet(self):
-        """Atomic parquet save with error handling for all symbols"""
+            self.state.last_parquet_save = current_time
+
+    def _save_parquet(self) -> None:
         try:
             timestamp = datetime.utcnow().strftime('%Y%m%d_%H')
-            
             for symbol in self.symbols:
-                # Save 1-min buffer
-                with self.buffer_lock:
-                    if symbol in self.one_min_buffers and self.one_min_buffers[symbol]:
-                        df_1m = pd.DataFrame(list(self.one_min_buffers[symbol]))
-                        
-                        file_path = os.path.join(
-                            self.parquet_dir,
-                            f"{symbol.lower()}_1m_{timestamp}.parquet"
-                        )
-                        
-                        table = pa.Table.from_pandas(df_1m)
-                        pq.write_table(table, file_path)
-                        logging.info(f"Saved 1-min parquet: {file_path}")
-                        
-                # Save 5-min buffer
-                with self.buffer_lock:
-                    if symbol in self.five_min_buffers and self.five_min_buffers[symbol]:
-                        df_5m = pd.DataFrame(list(self.five_min_buffers[symbol]))
-                        
-                        file_path = os.path.join(
-                            self.parquet_dir,
-                            f"{symbol.lower()}_5m_{timestamp}.parquet"
-                        )
-                        
-                        table = pa.Table.from_pandas(df_5m)
-                        pq.write_table(table, file_path)
-                        logging.info(f"Saved 5-min parquet: {file_path}")
-                
+                self._save_symbol_parquet(symbol, timestamp, '1m', self.one_min_buffers)
+                self._save_symbol_parquet(symbol, timestamp, '5m', self.five_min_buffers)
         except Exception as e:
-            logging.error(f"Parquet save failed: {e}", exc_info=True)
-            
-    def start(self):
-        """Start WebSocket connection with daemon thread"""
-        with self.ws_lock:
-            if self.ws and self.is_connected:
-                logging.warning("WebSocket already running")
-                return
-                
-            self.ws = websocket.WebSocketApp(
-                self.ws_url,
-                on_open=self.on_open,
-                on_message=self.on_message,
-                on_error=self.on_error,
-                on_close=self.on_close
-            )
-            
-            # Start in daemon thread
-            ws_thread = threading.Thread(target=self._run_forever, daemon=True)
-            ws_thread.start()
-            
-            logging.info(f"Feed handler started for {len(self.symbols)} pairs")
-            
-    def _run_forever(self):
-        """WebSocket run loop with keepalive"""
-        while not self.shutdown_flag:
-            try:
-                if self.ws:
-                    self.ws.run_forever(
-                        ping_interval=60,  # Send ping every 60s
-                        ping_timeout=10    # Wait 10s for pong
-                    )
-            except Exception as e:
-                logging.error(f"WebSocket run_forever error: {e}", exc_info=True)
-                if not self.shutdown_flag:
-                    time.sleep(self.reconnect_delay)
-                    
-    def stop(self):
-        """Graceful shutdown"""
-        logging.info("Stopping feed handler...")
-        self.shutdown_flag = True
-        self.is_connected = False
-        
-        if self.ws:
-            try:
-                self.ws.close()
-            except:
-                pass
-            
-        # Final save
-        self._save_parquet()
-        logging.info("Feed handler stopped")
-        
-    def get_buffers(self):
-        """Thread-safe buffer inspection for all symbols"""
+            self.logger.error(f"Parquet save failed: {e}", exc_info=True)
+
+    def _save_symbol_parquet(self, symbol: str, timestamp: str, timeframe: str, buffers: Dict[str, deque]) -> None:
         with self.buffer_lock:
-            return {
-                'one_min': {s: list(b) for s, b in self.one_min_buffers.items()},
-                'five_min': {s: list(b) for s, b in self.five_min_buffers.items()}
-            }
-            
-    def get_status(self):
-        """Get current feed status"""
-        buffers = self.get_buffers()
-        return {
-            'connected': self.is_connected,
-            'symbols': [s.upper() for s in self.symbols],
-            'last_parquet_save': self.last_parquet_save
-        }
+            if symbol not in buffers or not buffers[symbol]:
+                return
+            df = pd.DataFrame(list(buffers[symbol]))
+        file_path = os.path.join(self.parquet_dir, f"{symbol}_{timeframe}_{timestamp}.parquet")
+        table = pa.Table.from_pandas(df)
+        pq.write_table(table, file_path)
+        self.logger.info(f"Saved {timeframe} parquet: {file_path}")
 
+    def get_buffers(self) -> Dict[str, Dict[str, List]]:
+        with self.buffer_lock:
+            return {'one_min': {s: list(b) for s, b in self.one_min_buffers.items()}, 'five_min': {s: list(b) for s, b in self.five_min_buffers.items()}}
 
-# ============================================================================
-# SAMPLE BUFFER DUMP GENERATOR
-# Creates realistic SOLUSDT data for demonstration
-# ============================================================================
+    def get_status(self) -> Dict[str, Any]:
+        return {'connected': self.state.connected, 'running': self.state.running, 'symbols': [s.upper() for s in self.symbols], 'reconnect_attempts': self.state.reconnect_attempts, 'last_parquet_save': self.state.last_parquet_save, 'last_bar_timestamps': dict(self.state.last_bar_timestamps)}
+
 
 def generate_sample_buffer():
-    """Generate realistic SOLUSDT sample data"""
-    base_price = 195.50  # SOL typical price
+    base_price = 195.50
     current_time = datetime.utcnow().replace(second=0, microsecond=0)
-    
     one_min_bars = []
     five_min_bars = []
-    
-    # Generate 100 1-minute bars (last ~1.6 hours)
     for i in range(100):
         timestamp = current_time - timedelta(minutes=100-i)
-        
-        # Create realistic price movement with some volatility
-        noise = (hash(str(i)) % 1000) / 10000  # Pseudo-random 0-0.1%
-        trend = i * 0.0001  # Slight upward trend
-        
-        # Add some realistic volatility patterns
-        volatility = 0.001 if i % 20 != 0 else 0.003  # Higher vol every 20 bars
-        
+        noise = (hash(str(i)) % 1000) / 10000
+        trend = i * 0.0001
+        volatility = 0.001 if i % 20 != 0 else 0.003
         open_price = base_price + (i * 0.02) + (noise - 0.005)
-        close_price = open_price + (trend) + (noise - 0.005) + (volatility * (hash(str(i)) % 100 - 50) / 100)
+        close_price = open_price + trend + (noise - 0.005) + (volatility * (hash(str(i)) % 100 - 50) / 100)
         high_price = max(open_price, close_price) + abs(noise * 2) + volatility
         low_price = min(open_price, close_price) - abs(noise * 2) - volatility
-        volume = 1500 + (hash(str(i)) % 2000)  # 1500-3500 range
-        
-        one_min_bars.append({
-            'timestamp': timestamp,
-            'open': round(open_price, 4),
-            'high': round(high_price, 4),
-            'low': round(low_price, 4),
-            'close': round(close_price, 4),
-            'volume': round(volume, 2),
-            'n_trades': int(volume / 10),  # ~10 SOL per trade
-            'quote_volume': round(volume * open_price, 2),
-            'taker_buy_base': round(volume * 0.45, 2),  # 45% taker
-            'taker_buy_quote': round(volume * 0.45 * open_price, 2),
-            'is_closed': True
-        })
-    
-    # Generate 20 5-minute bars (last ~1.6 hours)
+        volume = 1500 + (hash(str(i)) % 2000)
+        one_min_bars.append({'timestamp': timestamp, 'open': round(open_price, 4), 'high': round(high_price, 4), 'low': round(low_price, 4), 'close': round(close_price, 4), 'volume': round(volume, 2), 'n_trades': int(volume / 10), 'quote_volume': round(volume * open_price, 2), 'taker_buy_base': round(volume * 0.45, 2), 'taker_buy_quote': round(volume * 0.45 * open_price, 2), 'is_closed': True})
     for i in range(20):
         timestamp = current_time - timedelta(minutes=100-i*5)
-        
-        # Aggregate 5 one-min bars
         start_idx = i * 5
         end_idx = start_idx + 5
-        
         if end_idx <= len(one_min_bars):
             bars_subset = one_min_bars[start_idx:end_idx]
-            
-            five_min_bars.append({
-                'timestamp': timestamp,
-                'open': bars_subset[0]['open'],
-                'high': max(b['high'] for b in bars_subset),
-                'low': min(b['low'] for b in bars_subset),
-                'close': bars_subset[-1]['close'],
-                'volume': round(sum(b['volume'] for b in bars_subset), 2),
-                'n_trades': sum(b['n_trades'] for b in bars_subset),
-                'quote_volume': round(sum(b['quote_volume'] for b in bars_subset), 2),
-                'taker_buy_base': round(sum(b['taker_buy_base'] for b in bars_subset), 2),
-                'taker_buy_quote': round(sum(b['taker_buy_quote'] for b in bars_subset), 2)
-            })
-    
+            five_min_bars.append({'timestamp': timestamp, 'open': bars_subset[0]['open'], 'high': max(b['high'] for b in bars_subset), 'low': min(b['low'] for b in bars_subset), 'close': bars_subset[-1]['close'], 'volume': round(sum(b['volume'] for b in bars_subset), 2), 'n_trades': sum(b['n_trades'] for b in bars_subset), 'quote_volume': round(sum(b['quote_volume'] for b in bars_subset), 2), 'taker_buy_base': round(sum(b['taker_buy_base'] for b in bars_subset), 2), 'taker_buy_quote': round(sum(b['taker_buy_quote'] for b in bars_subset), 2)})
     return one_min_bars, five_min_bars
 
 
-# ============================================================================
-# MAIN EXECUTION
-# ============================================================================
-
 if __name__ == "__main__":
     import sys
-    
-    # Check if user wants to run live or just see sample
     if len(sys.argv) > 1 and sys.argv[1] == '--sample':
         print("Generating sample buffer dump...\n")
         one_min, five_min = generate_sample_buffer()
-        
         print("=" * 80)
         print("SOL-PERP LIVE FEED BUFFER DUMP")
         print("=" * 80)
         print(f"\n1-Minute Buffer (showing last 10 of {len(one_min)} bars):")
         print("-" * 80)
-        print(f"{'Timestamp':<20} {'Open':<8} {'High':<8} {'Low':<8} {'Close':<8} {'Volume':<10}")
-        print("-" * 80)
         for bar in one_min[-10:]:
-            print(f"{bar['timestamp'].strftime('%Y-%m-%d %H:%M'):<20} "
-                  f"{bar['open']:<8.4f} {bar['high']:<8.4f} {bar['low']:<8.4f} "
-                  f"{bar['close']:<8.4f} {bar['volume']:<10.2f}")
-        
+            print(f"{bar['timestamp'].strftime('%Y-%m-%d %H:%M'):<20} {bar['open']:<8.4f} {bar['high']:<8.4f} {bar['low']:<8.4f} {bar['close']:<8.4f} {bar['volume']:<10.2f}")
         print(f"\n5-Minute Resampled Buffer (showing last 5 of {len(five_min)} bars):")
         print("-" * 80)
-        print(f"{'Timestamp':<20} {'Open':<8} {'High':<8} {'Low':<8} {'Close':<8} {'Volume':<10}")
-        print("-" * 80)
         for bar in five_min[-5:]:
-            print(f"{bar['timestamp'].strftime('%Y-%m-%d %H:%M'):<20} "
-                  f"{bar['open']:<8.4f} {bar['high']:<8.4f} {bar['low']:<8.4f} "
-                  f"{bar['close']:<8.4f} {bar['volume']:<10.2f}")
-        
-        print("\n" + "=" * 80)
-        print("Parquet files would be saved to: data/live_buffer/")
-        print("Hourly rollover format: solusdt_[1m|5m]_YYYYMMDD_HH.parquet")
-        print("=" * 80)
-        
+            print(f"{bar['timestamp'].strftime('%Y-%m-%d %H:%M'):<20} {bar['open']:<8.4f} {bar['high']:<8.4f} {bar['low']:<8.4f} {bar['close']:<8.4f} {bar['volume']:<10.2f}")
     else:
-        # Live mode
         print("Starting live WebSocket feed handler...")
-        print("Press Ctrl+C to stop gracefully\n")
-        
         feed = BinanceWebSocketFeed(symbols='SOLUSDT')
         feed.start()
-        
         try:
-            # Run indefinitely with status updates
             while True:
-                time.sleep(30)  # Print status every 30 seconds
+                time.sleep(30)
                 status = feed.get_status()
-                print(f"Status: {status['one_min_bars']} 1-min bars, "
-                      f"{status['five_min_bars']} 5-min bars, "
-                      f"Connected: {status['connected']}")
+                print(f"Status: Connected={status['connected']}, Reconnects={status['reconnect_attempts']}")
         except KeyboardInterrupt:
             print("\nShutting down...")
             feed.stop()

@@ -1,98 +1,137 @@
 # strategy_orchestrator.py
+"""
+Strategy Orchestrator: Fleet Manager for LiveEventDetectorGem instances.
+"""
 
 import logging
-import asyncio
-from typing import Dict, Any, List
+from dataclasses import dataclass, field
+from typing import Dict, Any, List, Optional, Callable
+
 from live_event_detector_gem import LiveEventDetectorGem
 from telegram_bot import TelegramBot
 
-class StrategyOrchestrator:
-    """
-    Manages a fleet of LiveEventDetectorGem instances.
-    - Routes feed updates to the correct symbol detector
-    - Enforces global risk limits (Max Active Trades)
-    - Centralizes logging and alerting
-    """
 
-    def __init__(self, symbols: List[str], max_active_trades: int = 3, enable_telegram: bool = True):
-        self.logger = logging.getLogger('StrategyOrchestrator')
-        self._setup_logging()
-        
-        self.symbols = symbols
-        self.max_active_trades = max_active_trades
-        self.active_positions = 0
-        
-        # Initialize Telegram Bot once (shared)
-        self.telegram = TelegramBot() if enable_telegram else None
-        
-        # Initialize Fleet
-        self.detectors: Dict[str, LiveEventDetectorGem] = {}
-        for sym in symbols:
-            self.detectors[sym] = LiveEventDetectorGem(
-                symbol=sym,
-                event_callback=self._handle_signal,
-                enable_telegram=False, # Orchestrator handles Telegram to enforce risk check first
-                telegram_bot=self.telegram
-            )
-        
+@dataclass
+class OrchestratorState:
+    active_positions: int = 0
+    symbols: tuple = field(default_factory=tuple)
+    max_active_trades: int = 3
+
+
+def is_at_max_capacity(active_positions: int, max_active_trades: int) -> bool:
+    return active_positions >= max_active_trades
+
+
+def increment_active_positions(current: int) -> int:
+    return current + 1
+
+
+def decrement_active_positions(current: int) -> int:
+    return max(current - 1, 0)
+
+
+def is_valid_symbol(symbol: Optional[str], known_symbols: Dict[str, Any]) -> bool:
+    return symbol is not None and symbol in known_symbols
+
+
+def setup_orchestrator_logging() -> logging.Logger:
+    logger = logging.getLogger('StrategyOrchestrator')
+    if not logger.handlers:
+        logging.basicConfig(level=logging.INFO)
+    return logger
+
+
+def create_detector_fleet(
+    symbols: List[str],
+    signal_callback: Callable,
+    telegram_bot: Optional[TelegramBot]
+) -> Dict[str, LiveEventDetectorGem]:
+    detectors = {}
+    for symbol in symbols:
+        detectors[symbol] = LiveEventDetectorGem(
+            symbol=symbol,
+            event_callback=signal_callback,
+            enable_telegram=False,
+            telegram_bot=telegram_bot
+        )
+    return detectors
+
+
+class StrategyOrchestrator:
+    def __init__(
+        self,
+        symbols: List[str],
+        max_active_trades: int = 3,
+        enable_telegram: bool = True
+    ):
+        self.logger = setup_orchestrator_logging()
+        self.state = OrchestratorState(
+            active_positions=0,
+            symbols=tuple(symbols),
+            max_active_trades=max_active_trades
+        )
+        self.telegram: Optional[TelegramBot] = TelegramBot() if enable_telegram else None
+        self.detectors = create_detector_fleet(
+            symbols=symbols,
+            signal_callback=self._handle_signal,
+            telegram_bot=self.telegram
+        )
         self.logger.info(f"Orchestrator initialized for {len(symbols)} pairs: {symbols}")
         self.logger.info(f"Global Risk Limit: Max {max_active_trades} active trades")
 
-    def _setup_logging(self):
-        log_dir = 'logs'
-        # Orchestrator uses its own log or shares; detectors use their own named logs.
-        # This setup is just for the Orchestrator shell itself.
-        if not self.logger.handlers:
-            logging.basicConfig(level=logging.INFO)
+    @property
+    def symbols(self) -> tuple:
+        return self.state.symbols
+    
+    @property
+    def max_active_trades(self) -> int:
+        return self.state.max_active_trades
+    
+    @property
+    def active_positions(self) -> int:
+        return self.state.active_positions
+    
+    @active_positions.setter
+    def active_positions(self, value: int) -> None:
+        self.state.active_positions = value
 
-    def on_bar_update(self, bar_data: Dict[str, Any]):
-        """
-        Route incoming 5-min bar to the correct detector.
-        Expected bar_data format: {'symbol': 'SOLUSDT', ...bar_fields...}
-        """
+    def on_bar_update(self, bar_data: Dict[str, Any]) -> None:
         symbol = bar_data.get('symbol')
-        if not symbol or symbol not in self.detectors:
-            # self.logger.warning(f"Received update for unknown symbol: {symbol}")
+        if not is_valid_symbol(symbol, self.detectors):
             return
-
-        # Forward to specific detector
         self.detectors[symbol].on_5min_bar(bar_data)
 
-    async def _handle_signal(self, event_data: Dict[str, Any]):
-        """
-        Central logic for signal execution.
-        Check global risk limits before allowing trade.
-        """
+    async def _handle_signal(self, event_data: Dict[str, Any]) -> None:
         symbol = event_data['symbol']
         direction = event_data['direction']
         
-        # Check Global Risk
-        if self.active_positions >= self.max_active_trades:
-            self.logger.warning(f"⚠️ [RISK] Signal IGNORED for {symbol}: Max active trades ({self.max_active_trades}) reached.")
-            if self.telegram:
-                await self.telegram.send_message(f"⚠️ **SIGNAL IGNORED**\n{symbol} {direction} valid but capped by Max Trades ({self.max_active_trades}).")
+        if is_at_max_capacity(self.state.active_positions, self.state.max_active_trades):
+            await self._handle_signal_rejected(symbol, direction)
             return
+        
+        self.state.active_positions = increment_active_positions(self.state.active_positions)
+        print(f"✅ [ORCHESTRATOR] Approved Signal: {symbol} {direction}. Total Active: {self.state.active_positions}")
+        await self._send_entry_notification(event_data)
 
-        # If allowed, increment active positions (Assume execution)
-        # Note: In a real system, we'd wait for trade confirmation. 
-        # Here we assume entry = active position.
-        # We need a way to decrement this later (e.g., on exit signal or timeout).
-        # For now, let's just log it. A full LifecycleManager is needed for true state tracking.
-        self.active_positions += 1
-        
-        print(f"✅ [ORCHESTRATOR] Approved Signal: {symbol} {direction}. Total Active: {self.active_positions}")
-        
-        # Send Alert (since we disabled internal detector alerts to control risk)
+    async def _handle_signal_rejected(self, symbol: str, direction: str) -> None:
+        self.logger.warning(f"⚠️ [RISK] Signal IGNORED for {symbol}: Max active trades ({self.state.max_active_trades}) reached.")
         if self.telegram:
-            await self.telegram.send_entry_alert(
-                pair=symbol,
-                direction=direction,
-                entry_price=event_data['entry_price'],
-                event_type=event_data['event_type'],
-                stop_loss=event_data['stop_loss'],
-                take_profit=event_data['take_profit'],
-                atr=event_data['atr'],
-                timestamp=event_data['timestamp']
-            )
-            
-        # TODO: Forward to TradeExecutor if automated
+            await self.telegram.send_message(f"⚠️ **SIGNAL IGNORED**\n{symbol} {direction} valid but capped by Max Trades ({self.state.max_active_trades}).")
+
+    async def _send_entry_notification(self, event_data: Dict[str, Any]) -> None:
+        if not self.telegram:
+            return
+        await self.telegram.send_entry_alert(
+            pair=event_data['symbol'],
+            direction=event_data['direction'],
+            entry_price=event_data['entry_price'],
+            event_type=event_data['event_type'],
+            stop_loss=event_data['stop_loss'],
+            take_profit=event_data['take_profit'],
+            atr=event_data['atr'],
+            timestamp=event_data['timestamp']
+        )
+
+    def register_exit(self, symbol: str) -> None:
+        self.state.active_positions = decrement_active_positions(self.state.active_positions)
+        self.logger.info(f"Position closed: {symbol}. Total Active: {self.state.active_positions}")
