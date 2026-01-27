@@ -1,43 +1,50 @@
-# Liquidity Events Trading Bot
+# Liquidity Events Trading Bot (Version F - VPS Edition)
 
-A real-time cryptocurrency trading bot that detects liquidity events and executes paper trades with Telegram notifications.
+A real-time cryptocurrency trading bot that detects liquidity events (sweeps, clusters) using forensic 1-minute logic and executes trades with risk containment.
 
-## Features
+## Version F Features (VPS Verified)
 
-- **WebSocket Feed Handler**: Real-time data streaming with 5-minute resampling
-- **Live Event Detection**: Identifies sweeps, clusters, and thinning patterns
-- **Telegram Integration**: Instant alerts for entries, exits, and daily summaries
-- **Paper Trading**: Safe testing environment with daily limits
-- **Thread-Safe Architecture**: Production-ready design
+- **1-Minute Forensic Logic**: Detects `Cluster` and `Sweep` events using 1-minute bars (previously 5m) to match backtest sensitivity.
+- **Persistent State**: Cluster state and trade history are saved to disk (`data/state/strategy_state.json`), surviving restarts.
+- **WebSocket Feed**: Aggregates 1m bars from Binance Futures and streams them directly to the strategy.
+- **Risk Engine**: Daily loss limits (-100R testnet) and correlation guards.
+- **Telegram Command & Control**: Real-time alerts and `/KILL` switch functionality.
 
-## Quick Start
+## Quick Start (VPS)
 
-1. Install dependencies:
-```bash
-pip install -r requirements.txt
-```
+1. **Clone & Setup**:
+   ```bash
+   git clone https://github.com/vsehuinya1/liquidity_events_version_F.git
+   cd liquidity_events_version_F
+   pip install -r requirements.txt
+   ```
 
-2. Copy the example config:
-```bash
-cp config.example.py config.py
-```
+2. **Configuration**:
+   Copy `config.example.py` to `config.py` and set your `TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID`, and `BINANCE_API_KEY`.
 
-3. Edit `config.py` with your Telegram bot token and chat ID
+3. **Run**:
+   ```bash
+   # Use PM2 for production
+   pm2 start main_testnet.py --name "trading_bot_vF" --interpreter python3
+   ```
 
-4. Run the bot:
-```bash
-python main.py
-```
+   **Monitor Logs**:
+   ```bash
+   pm2 logs trading_bot_vF
+   ```
 
-## Configuration
+## Backtest Comparison
 
-See `config.example.py` for all available configuration options.
+| Feature | Backtest (Option F) | Live Bot (Version F) |
+| :--- | :--- | :--- |
+| **Timeframe** | 1-minute | **1-minute** (Synced ✅) |
+| **Lookback** | 20 bars (20m) | **20 bars** (20m) (Synced ✅) |
+| **Logic** | Dynamic Filters | **Dynamic Filters** (Synced ✅) |
+| **Cooldown** | ~1 Hour ATR | **Disabled** (By Request) |
 
-## Paper Trading
+## Repository Structure
 
-The bot includes a paper trading executor that simulates trades without real capital. Check `logs/paper_trading_*.log` for trade history.
-
-## Version History
-
-- v0.4.0: Paper trading with Telegram alerts
-- v1.1.0: Multi-pair support with global risk containment and improved WebSocket handler
+- `main_testnet.py`: Entry point, orchestrates feed, risk, and execution.
+- `live_event_detector_gem.py`: **Core Logic**. Handles signal detection and state.
+- `websocket_handler_improved.py`: Manages Binance connection and bar buffering.
+- `strategy_orchestrator.py`: Routes signals and manages fleet state.
