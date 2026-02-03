@@ -20,7 +20,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Optional, Callable, List, Dict, Any
 
-from config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
+from bot_config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
 
 
 # =============================================================================
@@ -76,17 +76,26 @@ def format_entry_alert(
     direction: str,
     entry_price: float,
     event_type: str,
-    atr: float
+    atr: float,
+    stop_loss: float = 0.0,
+    take_profit: float = 0.0
 ) -> str:
     """Format entry alert message."""
     emoji = DIRECTION_EMOJIS.get(direction, '▶️')
-    return (
+    msg = (
         f"<b>🎯 NEW TRADE</b>\n"
         f"{emoji} {pair} {direction}\n"
         f"Entry: {entry_price}\n"
+    )
+    if stop_loss > 0:
+        msg += f"Stop: {stop_loss}\n"
+    if take_profit > 0:
+        msg += f"TP: {take_profit}\n"
+    msg += (
         f"Event: {event_type}\n"
         f"ATR: {atr:.4f}"
     )
+    return msg
 
 
 def format_exit_alert(
@@ -94,7 +103,7 @@ def format_exit_alert(
     direction: str,
     exit_price: float,
     pnl_bp: float,
-    reason: str
+    reason: str = "Trailing Stop"
 ) -> str:
     """Format exit alert message."""
     emoji = '🟢' if pnl_bp > 0 else '🔴'
@@ -166,9 +175,13 @@ def extract_message_info(update: Dict[str, Any]) -> tuple:
     Returns (update_id, text, sender_id).
     """
     update_id = update.get('update_id', 0)
-    msg = update.get('message', {})
+    
+    # Check for different types of updates
+    msg = update.get('message') or update.get('channel_post') or update.get('edited_message') or update.get('edited_channel_post') or {}
+    
     text = msg.get('text', '').strip()
     sender_id = str(msg.get('chat', {}).get('id', ''))
+    
     return update_id, text, sender_id
 
 
@@ -434,31 +447,30 @@ class TelegramBot:
         stop_loss: float,
         take_profit: float,
         atr: float,
-        timestamp: Any
+        timestamp: Any,
+        **kwargs
     ) -> bool:
         """
         Send entry alert.
-        Note: stop_loss, take_profit, timestamp preserved for interface compatibility.
+        Note: timestamp, kwargs preserved for interface compatibility.
         """
-        msg = format_entry_alert(pair, direction, entry_price, event_type, atr)
+        msg = format_entry_alert(pair, direction, entry_price, event_type, atr, stop_loss, take_profit)
         return await self._send_message(msg)
 
     async def send_exit_alert(
         self,
         pair: str,
         direction: str,
-        entry_price: float,
         exit_price: float,
-        pnl_bp: float,
-        reason: str,
-        hold_time: Any,
-        timestamp: Any
+        pnl_r: float,
+        timestamp: Any,
+        **kwargs
     ) -> bool:
         """
         Send exit alert.
-        Note: entry_price, hold_time, timestamp preserved for interface compatibility.
+        Note: timestamp, kwargs preserved for interface compatibility.
         """
-        msg = format_exit_alert(pair, direction, exit_price, pnl_bp, reason)
+        msg = format_exit_alert(pair, direction, exit_price, pnl_r)
         return await self._send_message(msg)
 
     async def send_error_alert(self, error_message: str) -> bool:
