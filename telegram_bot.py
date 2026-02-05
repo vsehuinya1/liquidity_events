@@ -140,15 +140,11 @@ def format_tsl_update(pair: str, direction: str, new_stop: float, entry_price: f
     """Format trailing stop loss update message."""
     emoji = "🟢" if direction == "LONG" else "🔴"
     move_pct = abs((new_stop - entry_price) / entry_price * 100)
-    return f"{emoji} <b>TSL UPDATE</b> {pair}
-" \
-           f"Direction: {direction}
-" \
-           f"Entry: {entry_price:.4f}
-" \
-           f"New Stop: {new_stop:.4f}
-" \
-           f"Move: {move_pct:.2f}%"
+    return (f"{emoji} <b>TSL UPDATE</b> {pair}\n"
+            f"Direction: {direction}\n"
+            f"Entry: {entry_price:.4f}\n"
+            f"New Stop: {new_stop:.4f}\n"
+            f"Move: {move_pct:.2f}%")
 
 def format_kill_failed(error: str) -> str:
     """Format kill sequence failed message."""
