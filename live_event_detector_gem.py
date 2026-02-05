@@ -461,7 +461,7 @@ class LiveEventDetectorGem:
 
         self.SHARED_PARAMS = SharedParams(
             sweep_thinning_mult=1.2,
-            max_bars_since_cluster=20,
+            max_bars_since_cluster=60,
             prior_extreme_lookback=20,
             atr_period=20,
             atr_trailing_stop_mult=1.8,
