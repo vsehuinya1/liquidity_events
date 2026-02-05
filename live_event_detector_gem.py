@@ -100,7 +100,7 @@ class DetectorState:
     last_trade_pnl: float = 0.0
     recent_loss: bool = False
     consecutive_wins: int = 0
-    last_cluster_end_idx: int = -999
+    last_cluster_time: Optional[str] = None  # ISO string for serializability
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize state for persistence."""
@@ -114,7 +114,7 @@ class DetectorState:
             'last_trade_pnl': self.last_trade_pnl,
             'recent_loss': self.recent_loss,
             'consecutive_wins': self.consecutive_wins,
-            'last_cluster_end_idx': self.last_cluster_end_idx,
+            'last_cluster_time': self.last_cluster_time,
         }
 
     @classmethod
@@ -130,38 +130,39 @@ class DetectorState:
             last_trade_pnl=d.get('last_trade_pnl', 0.0),
             recent_loss=d.get('recent_loss', False),
             consecutive_wins=d.get('consecutive_wins', 0),
-            last_cluster_end_idx=d.get('last_cluster_end_idx', -999),
+            last_cluster_time=d.get('last_cluster_time'),
         )
 
 
 # --- Pure Functions: Signal Detection ---
 
 def calculate_indicators(df: pd.DataFrame, atr_period: int, prior_extreme_lookback: int) -> pd.DataFrame:
-    """Pure function: compute all technical indicators. No side effects."""
+    """Pure function: compute technical indicators. MATCHES BACKTEST EXACTLY."""
     df = df.copy()
     df['range'] = df['high'] - df['low']
     
     tr = pd.concat([
         df['high'] - df['low'],
-        abs(df['high'] - df['close'].shift()),
-        abs(df['low'] - df['close'].shift())
+        (df['high'] - df['close'].shift()).abs(),
+        (df['low'] - df['close'].shift()).abs()
     ], axis=1).max(axis=1)
     
     df['atr'] = tr.rolling(atr_period, min_periods=1).mean()
+    
+    df['upper_wick'] = df['high'] - df[['open', 'close']].max(axis=1)
+    df['lower_wick'] = df[['open', 'close']].min(axis=1) - df['low']
+    df['upper_wick_pct'] = df['upper_wick'] / df['range'].replace(0, np.nan)
+    df['lower_wick_pct'] = df['lower_wick'] / df['range'].replace(0, np.nan)
+    
+    df['roll_max_20'] = df['high'].shift(1).rolling(prior_extreme_lookback, min_periods=1).max()
+    df['roll_min_20'] = df['low'].shift(1).rolling(prior_extreme_lookback, min_periods=1).min()
+    
     df['atr_med_20'] = df['atr'].rolling(20, min_periods=1).median()
     df['atr_slope'] = df['atr'].diff(5)
     df['vol_pocket_active'] = (df['atr'] > df['atr_med_20']) & (df['atr_slope'] > 0)
     
     df['tr_roll_cluster'] = tr.rolling(5, min_periods=5).mean()
     df['tr_roll_prior'] = tr.shift(5).rolling(5, min_periods=5).mean()
-    
-    df['upper_wick'] = df['high'] - df[['open', 'close']].max(axis=1)
-    df['lower_wick'] = df[['open', 'close']].min(axis=1) - df['low']
-    df['upper_wick_pct'] = df['upper_wick'] / df['range']
-    df['lower_wick_pct'] = df['lower_wick'] / df['range']
-    
-    df['roll_max_20'] = df['high'].shift(1).rolling(prior_extreme_lookback, min_periods=1).max()
-    df['roll_min_20'] = df['low'].shift(1).rolling(prior_extreme_lookback, min_periods=1).min()
     
     return df
 
@@ -182,8 +183,8 @@ def detect_cluster(
 
 def check_sweep_eligibility(
     row: pd.Series,
-    current_idx: int,
-    last_cluster_end_idx: int,
+    df: pd.DataFrame,
+    last_cluster_time: Optional[str],
     shared_params: SharedParams
 ) -> bool:
     """Pure function: checks if bar passes shared sweep eligibility filters."""
@@ -195,10 +196,18 @@ def check_sweep_eligibility(
     if not row['vol_pocket_active']:
         return False
     
-    # Must be within N bars of cluster
-    if (current_idx - last_cluster_end_idx) > shared_params.max_bars_since_cluster:
+    # Check cluster lookback using timestamps
+    if last_cluster_time is None:
         return False
+        
+    cluster_ts = pd.to_datetime(last_cluster_time)
     
+    # Count how many bars have passed since the cluster timestamp
+    bars_since_cluster = len(df[df['timestamp'] > cluster_ts])
+    
+    if bars_since_cluster > shared_params.max_bars_since_cluster:
+        return False
+        
     return True
 
 
@@ -208,15 +217,22 @@ def detect_sweep_direction(
 ) -> Optional[str]:
     """Pure function: returns 'LONG', 'SHORT', or None based on sweep pattern."""
     # SHORT sweep: upper wick rejection above prior highs
-    if (row['upper_wick_pct'] > wick_pct_thresh and
-        row['high'] > row['roll_max_20'] and
-        row['close'] < row['roll_max_20']):
-        return 'SHORT'
+    is_valid_short = (
+        row['upper_wick_pct'] > wick_pct_thresh
+        and row['high'] > row['roll_max_20'] 
+        and row['close'] < row['roll_max_20']
+    )
     
     # LONG sweep: lower wick rejection below prior lows
-    if (row['lower_wick_pct'] > wick_pct_thresh and
-        row['low'] < row['roll_min_20'] and
-        row['close'] > row['roll_min_20']):
+    is_valid_long = (
+        row['lower_wick_pct'] > wick_pct_thresh
+        and row['low'] < row['roll_min_20'] 
+        and row['close'] > row['roll_min_20']
+    )
+    
+    if is_valid_short:
+        return 'SHORT'
+    elif is_valid_long:
         return 'LONG'
     
     return None
@@ -479,12 +495,17 @@ class LiveEventDetectorGem:
             handler = logging.FileHandler(os.path.join(log_dir, 'gem_detector.log'))
             handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(name)s: %(message)s'))
             self.logger.addHandler(handler)
+            
+            # Add StreamHandler for visibility in PM2/System logs
+            stream_handler = logging.StreamHandler()
+            stream_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(name)s: %(message)s'))
+            self.logger.addHandler(stream_handler)
 
     # --- Public API ---
 
-    def on_5min_bar(self, bar: Dict[str, Any]) -> None:
+    def on_bar(self, bar: Dict[str, Any]) -> None:
         """
-        Ingest new 5-min bar. Thread-safe entry point.
+        Ingest new bar. Thread-safe entry point.
         Early return: if bar is missing required fields.
         """
         with self.lock:
@@ -494,8 +515,11 @@ class LiveEventDetectorGem:
                     return  # Intentional early return: invalid bar data
                 
                 self.buffer.append(bar)
-                if len(self.buffer) > 50:
+                if len(self.buffer) >= 25:
                     self._process_bar()
+                else:
+                    if len(self.buffer) % 5 == 0:
+                        self.logger.info(f"Buffer warming up: {len(self.buffer)}/25 bars...")
 
             except Exception as e:
                 self.logger.error(f"Error processing bar: {e}", exc_info=True)
@@ -503,12 +527,77 @@ class LiveEventDetectorGem:
     def get_state(self) -> Dict[str, Any]:
         """Returns serializable state for persistence."""
         with self.lock:
-            return self.state.to_dict()
+            # Convert buffer timestamps to strings for JSON
+            buffer_json = []
+            for b in list(self.buffer):
+                b_copy = b.copy()
+                if isinstance(b_copy['timestamp'], (pd.Timestamp, datetime)):
+                    b_copy['timestamp'] = b_copy['timestamp'].isoformat()
+                buffer_json.append(b_copy)
+                
+            # Convert trade history objects to dicts
+            history_json = []
+            for t in self.trade_history:
+                if hasattr(t, '__dict__'):
+                    history_json.append(t.__dict__)
+                else:
+                    history_json.append(t)
+
+            # Convert any numpy/pandas types to Python native types for JSON
+            def convert_to_serializable(obj):
+                if obj is None:
+                    return None
+                if isinstance(obj, (np.bool_,)):
+                    return bool(obj)
+                if isinstance(obj, (np.integer,)):
+                    return int(obj)
+                if isinstance(obj, (np.floating,)):
+                    return float(obj)
+                if isinstance(obj, (pd.Timestamp, datetime)):
+                    return obj.isoformat()
+                if isinstance(obj, dict):
+                    return {k: convert_to_serializable(v) for k, v in obj.items()}
+                if isinstance(obj, (list, tuple)):
+                    return [convert_to_serializable(v) for v in obj]
+                return obj
+            
+            state_dict = convert_to_serializable(self.state.to_dict())
+            
+            return {
+                "state": state_dict,
+                "buffer": convert_to_serializable(buffer_json),
+                "pending_sweep": convert_to_serializable(self.pending_sweep.__dict__) if hasattr(self.pending_sweep, '__dict__') else self.pending_sweep,
+                "trade_history": convert_to_serializable(history_json)
+            }
 
     def restore_state(self, state_dict: Dict[str, Any]) -> None:
-        """Restore state from serialized dict."""
+        """Restore state and historical buffer from serialized dict."""
         with self.lock:
-            self.state = DetectorState.from_dict(state_dict)
+            # 1. Restore basic flags
+            if 'state' in state_dict:
+                self.state = DetectorState.from_dict(state_dict['state'])
+            
+            # 2. Restore buffer data
+            if 'buffer' in state_dict:
+                restored_buffer = deque(maxlen=self.buffer.maxlen)
+                for b in state_dict['buffer']:
+                    if isinstance(b.get('timestamp'), str):
+                        b['timestamp'] = pd.to_datetime(b['timestamp'])
+                    restored_buffer.append(b)
+                self.buffer = restored_buffer
+            
+            # 3. Restore trade history
+            if 'trade_history' in state_dict:
+                self.trade_history = []
+                for t in state_dict['trade_history']:
+                    if isinstance(t, dict):
+                        self.trade_history.append(VirtualTrade(**t))
+                    else:
+                        self.trade_history.append(t)
+            
+            self.pending_sweep = state_dict.get('pending_sweep')
+            
+            self.logger.info(f"✅ Restored {self.symbol} with {len(self.buffer)} bars in buffer.")
 
     # --- Main Processing Pipeline ---
 
@@ -630,12 +719,17 @@ class LiveEventDetectorGem:
     # --- Detection ---
 
     def _update_cluster_state(self, df: pd.DataFrame, current_idx: int) -> None:
-        """Side effect: updates state.last_cluster_end_idx if cluster detected."""
+        """Side effect: updates state.last_cluster_time if cluster detected."""
         row = df.iloc[current_idx]
         filters = self._get_filter_config()
 
         if detect_cluster(row, filters.cluster_compression_ratio):
-            self.state.last_cluster_end_idx = current_idx
+            ts = row['timestamp']
+            if isinstance(ts, (pd.Timestamp, datetime)):
+                self.state.last_cluster_time = ts.isoformat()
+            else:
+                self.state.last_cluster_time = str(ts)
+            self.logger.info(f"CLUSTER DETECTED at {self.state.last_cluster_time} (Ratio: {row['tr_roll_cluster']/row['tr_roll_prior']:.2f})")
 
     def _detect_sweep(self, df: pd.DataFrame, current_idx: int) -> None:
         """Side effect: sets self.pending_sweep if sweep pattern detected."""
@@ -643,8 +737,8 @@ class LiveEventDetectorGem:
 
         # Check eligibility (pure function)
         if not check_sweep_eligibility(
-            row, current_idx,
-            self.state.last_cluster_end_idx,
+            row, df,
+            self.state.last_cluster_time,
             self.SHARED_PARAMS
         ):
             return  # Intentional early return: not eligible
@@ -678,7 +772,7 @@ class LiveEventDetectorGem:
         """
         Side effect: emits trading signal, creates virtual trade, sends notifications.
         """
-        timestamp = bar['timestamp']
+        signal_timestamp = datetime.utcnow()  # Signal generation time, not bar time
         entry_price = bar['close']
 
         # Compute sizing (pure function)
@@ -716,11 +810,11 @@ class LiveEventDetectorGem:
         ))
 
         # Telegram notification (side effect)
-        self._send_telegram_alert(direction, entry_price, stop, atr, timestamp)
+        self._send_telegram_alert(direction, entry_price, stop, atr, signal_timestamp)
 
         # Build and emit event
         event_data = self._build_event_data(
-            bar, direction, entry_price, stop, atr, size_mult, timestamp
+            bar, direction, entry_price, stop, atr, size_mult, signal_timestamp
         )
         self._dispatch_event(event_data)
 
@@ -732,19 +826,39 @@ class LiveEventDetectorGem:
         atr: float,
         timestamp: Any
     ) -> None:
-        """Side effect: sends Telegram notification if configured."""
-        if self.telegram:
-            asyncio.create_task(self.telegram.send_entry_alert(
-                pair=self.symbol,
-                direction=direction,
-                entry_price=entry_price,
-                event_type=f"GEM_FUSION (Burst={self.state.burst_mode_active})",
-                stop_loss=stop,
-                take_profit=0,
-                atr=atr,
-                timestamp=timestamp,
-                trailing_stop_atr=self.SHARED_PARAMS.atr_trailing_stop_mult
-            ))
+        """Side effect: sends Telegram notification if configured. Thread-safe."""
+        if not self.telegram:
+            return
+        
+        # Schedule on main event loop using run_coroutine_threadsafe
+        async def send_alert():
+            try:
+                await self.telegram.send_entry_alert(
+                    pair=self.symbol,
+                    direction=direction,
+                    entry_price=entry_price,
+                    event_type=f"GEM_FUSION (Burst={self.state.burst_mode_active})",
+                    stop_loss=stop,
+                    take_profit=0,
+                    atr=atr,
+                    timestamp=timestamp,
+                    trailing_stop_atr=self.SHARED_PARAMS.atr_trailing_stop_mult
+                )
+            except Exception as e:
+                self.logger.error(f"Telegram alert error: {e}", exc_info=True)
+        
+        try:
+            # Try to get the running loop and schedule the coroutine
+            loop = asyncio.get_running_loop()
+            asyncio.run_coroutine_threadsafe(send_alert(), loop)
+        except RuntimeError:
+            # No loop running, use threading with asyncio.run
+            def send_async():
+                try:
+                    asyncio.run(send_alert())
+                except Exception as e:
+                    self.logger.error(f"Telegram alert error: {e}", exc_info=True)
+            threading.Thread(target=send_async, daemon=True).start()
 
     def _build_event_data(
         self,
@@ -775,12 +889,18 @@ class LiveEventDetectorGem:
         }
 
     def _dispatch_event(self, event_data: Dict[str, Any]) -> None:
-        """Side effect: dispatches event to callback."""
-        if self.event_callback and asyncio.iscoroutinefunction(self.event_callback):
-            asyncio.run_coroutine_threadsafe(
-                self.event_callback(event_data),
-                asyncio.get_event_loop()
-            )
+        """Side effect: dispatches event to callback. Thread-safe for async callbacks."""
+        if not self.event_callback:
+            return
+        
+        if asyncio.iscoroutinefunction(self.event_callback):
+            # For async callbacks, use asyncio.run() in a new thread
+            def run_async():
+                try:
+                    asyncio.run(self.event_callback(event_data))
+                except Exception as e:
+                    self.logger.error(f"Async callback error: {e}", exc_info=True)
+            threading.Thread(target=run_async, daemon=True).start()
         else:
             threading.Thread(
                 target=self.event_callback,
@@ -800,24 +920,102 @@ class LiveEventDetectorGem:
             if hit:
                 pnl_r = compute_trade_pnl_r(trade, exit_price)
                 final_r = pnl_r * trade.size_mult
-                self._update_state_outcome(final_r)
+                self._update_state_outcome(final_r, trade, exit_price)
             else:
                 # Update trailing stop
+                old_stop = trade.stop
                 trade.stop = update_trailing_stop(
                     trade,
                     row['close'],
                     self.SHARED_PARAMS.atr_trailing_stop_mult
                 )
+                # Send TSL notification if stop moved
+                if trade.stop != old_stop and self.telegram:
+                    async def send_tsl():
+                        try:
+                            await self.telegram.send_tsl_update(
+                                pair=self.symbol,
+                                direction=trade.direction,
+                                new_stop=trade.stop,
+                                entry_price=trade.entry
+                            )
+                        except Exception as e:
+                            self.logger.error(f"TSL alert failed: {e}")
+                    
+                    try:
+                        loop = asyncio.get_running_loop()
+                        asyncio.run_coroutine_threadsafe(send_tsl(), loop)
+                    except RuntimeError:
+                        def send_async():
+                            try:
+                                asyncio.run(send_tsl())
+                            except Exception as e:
+                                self.logger.error(f"TSL alert failed: {e}")
+                        threading.Thread(target=send_async, daemon=True).start()
                 active_trades.append(trade)
 
         self.virtual_trades = active_trades
 
-    def _update_state_outcome(self, pnl_r: float) -> None:
+    def _update_state_outcome(self, pnl_r: float, trade: VirtualTrade = None, exit_price: float = None) -> None:
         """
         Side effect: updates all PnL-related state.
         Called upon trade closure (virtual or real).
         """
         self.logger.info(f"Trade Result: {pnl_r:.2f}R")
+        
+        # Send exit notification if trade details available
+        if trade and exit_price and self.telegram:
+            async def send_exit():
+                try:
+                    await self.telegram.send_exit_alert(
+                        pair=self.symbol,
+                        direction=trade.direction,
+                        exit_price=exit_price,
+                        pnl_r=pnl_r,
+                        timestamp=datetime.now()
+                    )
+                except Exception as e:
+                    self.logger.error(f"Exit alert failed: {e}")
+            
+            try:
+                # Try to get the running loop and schedule the coroutine
+                loop = asyncio.get_running_loop()
+                asyncio.run_coroutine_threadsafe(send_exit(), loop)
+            except RuntimeError:
+                # No loop running, use threading with asyncio.run
+                def send_async():
+                    try:
+                        asyncio.run(send_exit())
+                    except Exception as e:
+                        self.logger.error(f"Exit alert failed: {e}")
+                threading.Thread(target=send_async, daemon=True).start()
+        
+        # Log metrics to CSV
+        if trade and exit_price:
+            try:
+                import csv
+                import os
+                os.makedirs('analysis', exist_ok=True)
+                metrics_file = 'analysis/trade_metrics.csv'
+                file_exists = os.path.exists(metrics_file)
+                
+                with open(metrics_file, 'a', newline='') as f:
+                    writer = csv.writer(f)
+                    if not file_exists:
+                        writer.writerow(['timestamp', 'symbol', 'direction', 'entry_price', 'exit_price', 'pnl_r', 'atr'])
+                    writer.writerow([
+                        datetime.now().isoformat(),
+                        self.symbol,
+                        trade.direction,
+                        trade.entry,
+                        exit_price,
+                        round(pnl_r, 2),
+                        trade.atr
+                    ])
+                self.logger.info(f"Metrics logged to {metrics_file}")
+            except Exception as e:
+                self.logger.error(f"Metrics logging failed: {e}")
+        
         self.state.last_trade_pnl = pnl_r
         self.state.recent_loss = (pnl_r < 0)
         self.trade_history.append(pnl_r)

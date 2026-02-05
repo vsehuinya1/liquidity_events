@@ -145,6 +145,14 @@ def run_backtest(args):
         return
 
     df.sort_index(inplace=True)
+    
+    # Filter by date range if specified
+    if hasattr(args, 'start') and args.start:
+        df = df[df.index >= args.start]
+    if hasattr(args, 'end') and args.end:
+        df = df[df.index <= args.end]
+    print(f"Data range: {df.index[0]} to {df.index[-1]} ({len(df)} rows)")
+    
     if 'fundingRate' not in df.columns: df['fundingRate'] = 0.0
 
     # =============================
@@ -187,8 +195,9 @@ def run_backtest(args):
     cooldown_until_idx = -1
     last_trade_pnl = 0
     recent_loss = False
+    pending_sweep = None  # State machine for sweep confirmation (matches live detector)
 
-    print("Starting OPUS D (Dynamic) simulation...")
+    print("Starting OPUS F (Fusion - Fixed Confirmation) simulation...")
     
     for i in range(50, len(df) - 2):
         row = df.iloc[i]
@@ -289,6 +298,129 @@ def run_backtest(args):
             continue
 
         # -------------------------
+        # PENDING SWEEP CONFIRMATION (matches live detector)
+        # -------------------------
+        if pending_sweep is not None:
+            confirm = row  # Current bar is the confirmation bar
+            sweep_row = pending_sweep['sweep_row']
+            
+            if pending_sweep['bias'] == 'SHORT':
+                confirmed = confirm['close'] < sweep_row['close']
+            else:  # LONG
+                confirmed = confirm['close'] > sweep_row['close']
+            
+            if not confirmed:
+                if logger: logger.info(f"[FAILED] Sweep {pending_sweep['sweep_idx']} failed confirmation at {timestamp}")
+                pending_sweep = None
+                # Fall through to check for new sweep this bar
+            else:
+                # === CONFIRMATION PASSED - EXECUTE TRADE ===
+                if logger: logger.info(f"[CONFIRMED] {pending_sweep['bias']} sweep at {timestamp}")
+                
+                # SIZING
+                position_size_mult = 1.0
+                if ATTACK_MODE_ACTIVE:
+                    position_size_mult = config['ATTACK_SIZE_MULT']
+                    stats['sized_up_trades'] += 1
+                    if BURST_MODE_ACTIVE:
+                        stats['burst_mode_trades'] += 1
+                    if wins_in_attack >= 2:
+                        position_size_mult = config['HOT_STREAK_SIZE_MULT']
+                        stats['hot_streak_trades'] += 1
+                
+                # Funding Bonus
+                funding = sweep_row['fundingRate']
+                funding_aligned = False
+                if pending_sweep['bias'] == 'LONG' and funding < -0.0001: funding_aligned = True
+                elif pending_sweep['bias'] == 'SHORT' and funding > 0.0001: funding_aligned = True
+                if funding_aligned:
+                    position_size_mult += config['FUNDING_SQUEEZE_BONUS']
+                    stats['funding_aligned_trades'] += 1
+                
+                # EXECUTE
+                entry = confirm['close']
+                atr = pending_sweep['atr']
+                active_bias = pending_sweep['bias']
+                
+                if active_bias == 'LONG': stop = entry - INITIAL_STOP_ATR * atr
+                else: stop = entry + INITIAL_STOP_ATR * atr
+                
+                exit_price = None
+                R_raw = 0
+                
+                for j in range(i + 1, len(df)):
+                    current_bar = df.iloc[j]
+                    hi, lo, cl = current_bar['high'], current_bar['low'], current_bar['close']
+                    current_atr = current_bar['atr']
+                    
+                    if active_bias == 'LONG':
+                        if lo <= stop:
+                            exit_price = stop
+                            R_raw = (exit_price - entry) / (INITIAL_STOP_ATR * atr)
+                            break
+                        new_stop = cl - ATR_TRAILING_STOP_MULT * current_atr
+                        stop = max(stop, new_stop)
+                    else:
+                        if hi >= stop:
+                            exit_price = stop
+                            R_raw = (entry - exit_price) / (INITIAL_STOP_ATR * atr)
+                            break
+                        new_stop = cl + ATR_TRAILING_STOP_MULT * current_atr
+                        stop = min(stop, new_stop)
+                
+                if exit_price is None:
+                    pending_sweep = None
+                    continue  # Skip if trade never exited
+                
+                cost_r = (COST_BP / 10000) * 100 * position_size_mult
+                R_final = (R_raw * position_size_mult) - cost_r
+                
+                balance += balance * RISK_PER_TRADE * R_final
+                trade_results.append(R_final)
+                stats['total_trades'] += 1
+                
+                # POST-TRADE UPDATE
+                last_trade_pnl = R_final
+                recent_loss = (R_final < 0)
+                cooldown_until_idx = j + int(COOLDOWN_ATR * atr)
+                
+                if R_final > 0:
+                    consecutive_wins += 1
+                else:
+                    consecutive_wins = 0
+                
+                if ATTACK_MODE_ACTIVE:
+                    attack_session_pnl += R_final
+                    if R_final < 0:
+                        losses_in_attack += 1
+                        wins_in_attack = 0
+                    else:
+                        losses_in_attack = 0
+                        wins_in_attack += 1
+                        
+                if cooldown_counter > 0:
+                    cooldown_counter -= 1
+
+                # Log trade for CSV
+                trade_log.append({
+                    'timestamp': timestamp,
+                    'bias': active_bias,
+                    'entry_price': entry,
+                    'exit_price': exit_price,
+                    'R_raw': R_raw,
+                    'size_mult': position_size_mult,
+                    'R_final': R_final,
+                    'balance': balance,
+                    'burst_mode': BURST_MODE_ACTIVE,
+                    'hot_streak': wins_in_attack >= 2 if ATTACK_MODE_ACTIVE else False,
+                    'funding_aligned': funding_aligned
+                })
+                
+                active_bias = None
+                pending_sweep = None
+                continue  # Skip sweep detection after trade execution
+
+        # -------------------------
         # SIGNAL GENERATION
         # -------------------------
         tr_cluster = row['tr_roll_cluster']
@@ -305,7 +437,10 @@ def run_backtest(args):
         is_thin_enough = row['range'] <= SWEEP_THINNING_MULT * row['atr']
         bars_since_cluster = i - last_cluster_end_idx
         
-        if is_thin_enough and bars_since_cluster <= MAX_BARS_SINCE_CLUSTER:
+        # Use dynamic max_bars from args if available
+        max_bars = args.max_bars if args and hasattr(args, 'max_bars') else MAX_BARS_SINCE_CLUSTER
+        
+        if is_thin_enough and bars_since_cluster <= max_bars:
             prior_max = row['roll_max_20']
             prior_min = row['roll_min_20']
             
@@ -326,120 +461,16 @@ def run_backtest(args):
 
         if active_bias is None:
             continue
-
-        confirm = df.iloc[i + 1]
-        if active_bias == 'SHORT': failed = confirm['close'] < row['close']
-        else: failed = confirm['close'] > row['close']
-
-        if not failed:
-            continue
-            
-        # -------------------------
-        # SIZING
-        # -------------------------
-        position_size_mult = 1.0
         
-        if ATTACK_MODE_ACTIVE:
-            position_size_mult = config['ATTACK_SIZE_MULT']
-            stats['sized_up_trades'] += 1
-            if BURST_MODE_ACTIVE:
-               stats['burst_mode_trades'] += 1
-            
-            if wins_in_attack >= 2:
-                position_size_mult = config['HOT_STREAK_SIZE_MULT']
-                stats['hot_streak_trades'] += 1
-        
-        # Funding Bonus
-        funding = row['fundingRate']
-        funding_aligned = False
-        if active_bias == 'LONG' and funding < -0.0001: funding_aligned = True
-        elif active_bias == 'SHORT' and funding > 0.0001: funding_aligned = True
-            
-        if funding_aligned:
-            position_size_mult += config['FUNDING_SQUEEZE_BONUS']
-            stats['funding_aligned_trades'] += 1
-            
-        # -------------------------
-        # EXECUTE
-        # -------------------------
-        entry = confirm['close']
-        atr = row['atr']
-        
-        if active_bias == 'LONG': stop = entry - INITIAL_STOP_ATR * atr
-        else: stop = entry + INITIAL_STOP_ATR * atr
-
-        exit_price = None
-        R_raw = 0
-        
-        for j in range(i + 2, len(df)):
-            current_bar = df.iloc[j]
-            hi, lo, cl = current_bar['high'], current_bar['low'], current_bar['close']
-            current_atr = current_bar['atr']
-            
-            if active_bias == 'LONG':
-                if lo <= stop:
-                    exit_price = stop
-                    R_raw = (exit_price - entry) / atr
-                    break
-                new_stop = cl - ATR_TRAILING_STOP_MULT * current_atr
-                stop = max(stop, new_stop)
-            else:
-                if hi >= stop:
-                    exit_price = stop
-                    R_raw = (entry - exit_price) / atr
-                    break
-                new_stop = cl + ATR_TRAILING_STOP_MULT * current_atr
-                stop = min(stop, new_stop)
-
-        if exit_price is None:
-            continue
-
-        cost_r = (COST_BP / 10000) * 100 * position_size_mult
-        R_final = (R_raw * position_size_mult) - cost_r
-        
-        balance += balance * RISK_PER_TRADE * R_final
-        trade_results.append(R_final)
-        stats['total_trades'] += 1
-        
-        # -------------------------
-        # POST-TRADE UPDATE
-        # -------------------------
-        last_trade_pnl = R_final
-        recent_loss = (R_final < 0)
-        cooldown_until_idx = j + int(COOLDOWN_ATR * atr)
-        active_bias = None
-        
-        if R_final > 0:
-            consecutive_wins += 1
-        else:
-            consecutive_wins = 0
-        
-        if ATTACK_MODE_ACTIVE:
-            attack_session_pnl += R_final
-            if R_final < 0:
-                losses_in_attack += 1
-                wins_in_attack = 0
-            else:
-                losses_in_attack = 0
-                wins_in_attack += 1
-                
-        if cooldown_counter > 0:
-            cooldown_counter -= 1
-            
-        # Log trade for CSV
-        trade_log.append({
-            'timestamp': timestamp,
+        # Armed sweep - set pending confirmation (like live detector)
+        pending_sweep = {
             'bias': active_bias,
-            'entry_price': entry,
-            'exit_price': exit_price,
-            'R_raw': R_raw,
-            'size_mult': position_size_mult,
-            'R_final': R_final,
-            'balance': balance,
-            'burst_mode': BURST_MODE_ACTIVE,
-            'hot_streak': wins_in_attack >= 2 if ATTACK_MODE_ACTIVE else False,
-            'funding_aligned': funding_aligned
-        })
+            'sweep_row': row,
+            'atr': row['atr'],
+            'sweep_idx': i
+        }
+        if logger: logger.info(f"[ARMED] {active_bias} sweep at {timestamp}")
+        active_bias = None  # Reset for next iteration
 
     # =============================
     # RESULTS REPORT
@@ -479,14 +510,18 @@ def run_backtest(args):
     print(f"Kills (Drawdown):   {stats['attack_kills_dd']}")
     print("="*40)
     
-    # Save CSV (Disabled for Jul-Nov run)
-    # if trade_log:
-    #     pd.DataFrame(trade_log).to_csv("chronological_trades.csv", index=False)
-    #     print("\nSaved trade log to chronological_trades.csv")
+    # Save CSV
+    if trade_log:
+        pd.DataFrame(trade_log).to_csv("opus_F_trades_Feb2026.csv", index=False)
+        print("\nSaved trade log to opus_F_trades_Feb2026.csv")
 
 def main():
+    global logger
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_path', type=str)
+    parser.add_argument('--start', type=str, help='Start date YYYY-MM-DD')
+    parser.add_argument('--end', type=str, help='End date YYYY-MM-DD')
+    parser.add_argument('--max_bars', type=int, default=20, help='Max bars since cluster')
     args = parser.parse_args()
     
     logger = setup_logging()

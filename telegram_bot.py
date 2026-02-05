@@ -136,6 +136,20 @@ def format_kill_complete() -> str:
     return "<b>✅ KILL SEQUENCE COMPLETE. SYSTEM HALTED.</b>"
 
 
+def format_tsl_update(pair: str, direction: str, new_stop: float, entry_price: float) -> str:
+    """Format trailing stop loss update message."""
+    emoji = "🟢" if direction == "LONG" else "🔴"
+    move_pct = abs((new_stop - entry_price) / entry_price * 100)
+    return f"{emoji} <b>TSL UPDATE</b> {pair}
+" \
+           f"Direction: {direction}
+" \
+           f"Entry: {entry_price:.4f}
+" \
+           f"New Stop: {new_stop:.4f}
+" \
+           f"Move: {move_pct:.2f}%"
+
 def format_kill_failed(error: str) -> str:
     """Format kill sequence failed message."""
     return f"<b>❌ CRITICAL: KILL SEQUENCE FAILED: {error}</b>"
@@ -471,6 +485,17 @@ class TelegramBot:
         Note: timestamp, kwargs preserved for interface compatibility.
         """
         msg = format_exit_alert(pair, direction, exit_price, pnl_r)
+        return await self._send_message(msg)
+
+    async def send_tsl_update(
+        self,
+        pair: str,
+        direction: str,
+        new_stop: float,
+        entry_price: float
+    ) -> bool:
+        """Send trailing stop loss update alert."""
+        msg = format_tsl_update(pair, direction, new_stop, entry_price)
         return await self._send_message(msg)
 
     async def send_error_alert(self, error_message: str) -> bool:
