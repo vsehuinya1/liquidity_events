@@ -1,11 +1,11 @@
 # trade_executor_testnet.py
 """
 Testnet Trade Executor for Verification
-v2.1.0: Correctness fixes for partial fills, rate limiting, convergent exits
+v2.3.0: WebSocket-authoritative exits, polling advisory only
 
 Exit Detection Modes:
-1. USER_DATA_STREAM: Real-time via ORDER_TRADE_UPDATE (primary, <1s latency)
-2. ORDER_POLL: Periodic via futures_get_order (secondary, 5s interval)
+1. USER_DATA_STREAM: Real-time via ORDER_TRADE_UPDATE (AUTHORITATIVE, <1s latency)
+2. ORDER_POLL: Periodic via futures_get_order (ADVISORY ONLY, logs discrepancy, no state advance)
 3. POSITION_POLL: Fallback via position information (tertiary)
 
 v2.1 Fixes:
@@ -211,7 +211,7 @@ class TestnetTradeExecutor:
         
         # v2.1: Track recently exited symbols to prevent recon resurrection
         self._recently_exited: Dict[str, float] = {}  # symbol -> exit_timestamp
-        self._recently_exited_ttl = 10.0  # seconds
+        self._recently_exited_ttl = 60.0  # seconds (must be > recon interval)
         
         if self.state.kill_switch_active:
             self.logger.critical("🚨 STARTUP BLOCKED: 'kill_switch.flag' DETECTED. SYSTEM LOCKED.")
@@ -273,17 +273,69 @@ class TestnetTradeExecutor:
                         self.logger.debug(f"🔄 Recon: Skipping {symbol} (recently exited)")
                         continue
                     
-                    # Unknown position - add to tracking
+                    # Unknown position - add to tracking with stop orders
                     self.logger.warning(f"🔄 Recon: Discovered untracked position {symbol} on exchange")
-                    self.state.active_orders[symbol] = {
-                        'trade_id': f"RECON_{generate_trade_id()}",
-                        'direction': 'LONG' if pos_data['positionAmt'] > 0 else 'SHORT',
-                        'entry_price': pos_data['entryPrice'],
-                        'position_qty': abs(pos_data['positionAmt']),
-                        'exchange_update_time': pos_data['updateTime'],
-                        'discovered_at': current_time
-                    }
-                    added_count += 1
+                    
+                    # v2.3: Create stop orders for recon-discovered position
+                    direction = 'LONG' if pos_data['positionAmt'] > 0 else 'SHORT'
+                    entry_price = pos_data['entryPrice']
+                    position_qty = abs(pos_data['positionAmt'])
+                    
+                    # Estimate ATR from position (use default 1% of price if unknown)
+                    estimated_atr = entry_price * 0.01
+                    initial_stop = entry_price - (estimated_atr * 1.5) if direction == 'LONG' else entry_price + (estimated_atr * 1.5)
+                    hard_stop = compute_hard_stop_price(entry_price, direction)
+                    
+                    # Place stop orders
+                    stop_side = "SELL" if direction == "LONG" else "BUY"
+                    try:
+                        hard_stop_result = self.client.futures_create_order(
+                            symbol=symbol,
+                            side=stop_side,
+                            type="STOP_MARKET",
+                            stopPrice=round(hard_stop, 2),
+                            quantity=position_qty,
+                            closePosition=False
+                        )
+                        
+                        sl_result = self.client.futures_create_order(
+                            symbol=symbol,
+                            side=stop_side,
+                            type="STOP",
+                            stopPrice=round(initial_stop, 2),
+                            price=round(initial_stop * 0.995, 2) if direction == 'LONG' else round(initial_stop * 1.005, 2),
+                            quantity=position_qty,
+                            timeInForce="GTC"
+                        )
+                        
+                        self.state.active_orders[symbol] = {
+                            'trade_id': f"RECON_{generate_trade_id()}",
+                            'direction': direction,
+                            'entry_price': entry_price,
+                            'position_qty': position_qty,
+                            'stop_price': initial_stop,
+                            'hard_stop': hard_stop,
+                            'atr': estimated_atr,
+                            'sl_order_id': sl_result.get('orderId') or sl_result.get('algoId'),
+                            'hard_stop_id': hard_stop_result.get('orderId') or hard_stop_result.get('algoId'),
+                            'exchange_update_time': pos_data['updateTime'],
+                            'discovered_at': current_time
+                        }
+                        self.logger.info(f"🔄 Recon: Created stop orders for {symbol}")
+                        added_count += 1
+                        
+                    except Exception as e:
+                        self.logger.error(f"🔄 Recon: Failed to create stops for {symbol}: {e}")
+                        # Add without stop orders - will be skipped by TSL loop
+                        self.state.active_orders[symbol] = {
+                            'trade_id': f"RECON_{generate_trade_id()}",
+                            'direction': direction,
+                            'entry_price': entry_price,
+                            'position_qty': position_qty,
+                            'exchange_update_time': pos_data['updateTime'],
+                            'discovered_at': current_time
+                        }
+                        added_count += 1
             
             if added_count > 0:
                 save_state_to_file(self.state_file, self.state.active_orders)
@@ -717,23 +769,15 @@ class TestnetTradeExecutor:
                         except Exception as e:
                             self.logger.debug(f"Order status check failed for {order_id}: {e}")
                 
-                # If exit detected via polling
+                # v2.3: Polling detected fill - DO NOT advance state
+                # WebSocket is authoritative for exits
                 if exit_price is not None:
-                    with self._exit_lock:
-                        if symbol not in self.state.active_orders:
-                            continue  # Already handled by userDataStream
-                        
-                        self._recently_exited[symbol] = time.time()
-                        del self.state.active_orders[symbol]
-                        save_state_to_file(self.state_file, self.state.active_orders)
-                    
-                    await self._handle_exit(
-                        symbol=symbol,
-                        position=position,
-                        exit_price=exit_price,
-                        exit_via=exit_via,
-                        exchange_time=exchange_time
+                    self.logger.warning(
+                        f"🔄 POLL DETECTED FILL [{trade_id}] {symbol}: "
+                        f"exit={exit_price} | Waiting for WebSocket confirmation"
                     )
+                    # Trigger reconciliation to verify position status
+                    # State advancement only via on_order_update()
                     continue
                 
                 # Position still open - check for trailing stop update

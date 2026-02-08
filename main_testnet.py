@@ -20,7 +20,8 @@ from risk_manager import RiskManager
 from telegram_bot import TelegramBot
 from websocket_handler_improved import BinanceWebSocketFeed
 from strategy_orchestrator import StrategyOrchestrator
-from config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
+from user_data_stream import BinanceUserDataStream
+from config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, BINANCE_API_KEY, BINANCE_API_SECRET
 
 
 # =============================================================================
@@ -241,6 +242,16 @@ class TestnetVerificationSystem:
             # Initialize executor (requires bot for notifications)
             self.executor = TestnetTradeExecutor(telegram_bot=bot)
             
+            # v2.3: Start userDataStream for WebSocket-authoritative exits
+            user_stream = BinanceUserDataStream(
+                api_key=BINANCE_API_KEY,
+                api_secret=BINANCE_API_SECRET,
+                order_update_callback=self.executor.on_order_update,
+                testnet=True
+            )
+            user_stream.start()
+            self.logger.info("✅ UserDataStream started for ORDER_TRADE_UPDATE events")
+            
             # Wire kill-switch: Bot command -> system halt
             bot.set_kill_callback(self._create_kill_switch_callback())
             
@@ -278,9 +289,11 @@ class TestnetVerificationSystem:
             except asyncio.CancelledError:
                 self.logger.info("System Shutdown Initiated")
                 feed.stop()
+                user_stream.stop()
             except Exception as e:
                 self.logger.critical(f"System Crash: {e}")
                 feed.stop()
+                user_stream.stop()
 
 
 # =============================================================================
