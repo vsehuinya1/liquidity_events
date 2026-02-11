@@ -99,7 +99,7 @@ class StrategyOrchestrator:
         symbol = bar_data.get('symbol')
         if not is_valid_symbol(symbol, self.detectors):
             return
-        self.detectors[symbol].on_5min_bar(bar_data)
+        self.detectors[symbol].on_bar(bar_data)
 
     async def _handle_signal(self, event_data: Dict[str, Any]) -> None:
         symbol = event_data['symbol']
