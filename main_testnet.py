@@ -271,7 +271,16 @@ class TestnetVerificationSystem:
             feed.start()
             
             self.logger.info("✅ SYSTEM LIVE. Listening for Signals & /KILL command...")
-            
+
+            # Telegram startup notification
+            pairs_str = ', '.join(self.state.active_pairs)
+            await bot.send_message(
+                f"🟢 <b>System Online</b>\n"
+                f"Pairs: {pairs_str}\n"
+                f"Feed: Bucket-based 5m aggregation\n"
+                f"Kill: /KILL"
+            )
+
             # Keep alive until shutdown
             try:
                 await asyncio.gather(poll_task, exec_task)
