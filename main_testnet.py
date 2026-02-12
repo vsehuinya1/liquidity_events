@@ -37,7 +37,7 @@ class SystemState:
     kill_switch_triggered: bool = False
     active_pairs: tuple = field(default_factory=lambda: ('SOLUSDT',))
     # Immutable config
-    daily_loss_limit_r: float = -100.0
+    daily_loss_limit_r: float = -10.0
     max_active_correlated: int = 1
     max_active_trades: int = 10
 
@@ -161,7 +161,7 @@ def create_websocket_feed(
     """
     return BinanceWebSocketFeed(
         symbols=list(active_pairs),
-        on_5min_bar_callback=orchestrator.on_bar_update
+        on_1min_bar_callback=orchestrator.on_bar_update
     )
 
 
@@ -277,7 +277,7 @@ class TestnetVerificationSystem:
             await bot.send_message(
                 f"🟢 <b>System Online</b>\n"
                 f"Pairs: {pairs_str}\n"
-                f"Feed: Bucket-based 5m aggregation\n"
+                f"Feed: 1m direct (backtest-equivalent)\n"
                 f"Kill: /KILL"
             )
 
