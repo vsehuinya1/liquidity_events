@@ -20,6 +20,7 @@ from risk_manager import RiskManager
 from telegram_bot import TelegramBot
 from websocket_handler_improved import BinanceWebSocketFeed
 from strategy_orchestrator import StrategyOrchestrator
+from scheduled_reports import daily_report_task, weekly_report_task
 from config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
 
 
@@ -250,6 +251,13 @@ class TestnetVerificationSystem:
             # Background task: Trailing stop updates
             exec_task = asyncio.create_task(self.executor.update_trailing_stops())
             
+            # Background tasks: Scheduled Reports
+            daily_task = asyncio.create_task(daily_report_task(bot))
+            weekly_task = asyncio.create_task(weekly_report_task(bot))
+
+            # Inject main loop into orchestrator for threaded callbacks (Exit/TSL alerts)
+            self.orchestrator.set_async_loop(asyncio.get_running_loop())
+            
             # Create signal handler with explicit dependencies
             signal_handler = create_signal_handler(
                 state=self.state,
@@ -283,7 +291,7 @@ class TestnetVerificationSystem:
 
             # Keep alive until shutdown
             try:
-                await asyncio.gather(poll_task, exec_task)
+                await asyncio.gather(poll_task, exec_task, daily_task, weekly_task)
             except asyncio.CancelledError:
                 self.logger.info("System Shutdown Initiated")
                 feed.stop()

@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import Dict, Any, List, Optional, Callable
 
 from live_event_detector_gem import LiveEventDetectorGem
+import asyncio
 from telegram_bot import TelegramBot
 
 
@@ -111,27 +112,17 @@ class StrategyOrchestrator:
         
         self.state.active_positions = increment_active_positions(self.state.active_positions)
         print(f"✅ [ORCHESTRATOR] Approved Signal: {symbol} {direction}. Total Active: {self.state.active_positions}")
-        await self._send_entry_notification(event_data)
+        # Note: Entry notification is handled by the Executor (authoritative source)
 
     async def _handle_signal_rejected(self, symbol: str, direction: str) -> None:
         self.logger.warning(f"⚠️ [RISK] Signal IGNORED for {symbol}: Max active trades ({self.state.max_active_trades}) reached.")
         if self.telegram:
             await self.telegram.send_message(f"⚠️ **SIGNAL IGNORED**\n{symbol} {direction} valid but capped by Max Trades ({self.state.max_active_trades}).")
 
-    async def _send_entry_notification(self, event_data: Dict[str, Any]) -> None:
-        if not self.telegram:
-            return
-        await self.telegram.send_entry_alert(
-            pair=event_data['symbol'],
-            direction=event_data['direction'],
-            entry_price=event_data['entry_price'],
-            event_type=event_data['event_type'],
-            stop_loss=event_data['stop_loss'],
-            take_profit=event_data['take_profit'],
-            atr=event_data['atr'],
-            timestamp=event_data['timestamp']
-        )
-
-    def register_exit(self, symbol: str) -> None:
         self.state.active_positions = decrement_active_positions(self.state.active_positions)
         self.logger.info(f"Position closed: {symbol}. Total Active: {self.state.active_positions}")
+
+    def set_async_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Inject main event loop into all detectors for thread-safe callbacks."""
+        for detector in self.detectors.values():
+            detector.set_async_loop(loop)

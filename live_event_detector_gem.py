@@ -503,6 +503,10 @@ class LiveEventDetectorGem:
 
     # --- Public API ---
 
+    def set_async_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Set the main asyncio loop for scheduling callbacks from threads."""
+        self.main_loop = loop
+
     def on_bar(self, bar: Dict[str, Any]) -> None:
         """
         Ingest new bar. Thread-safe entry point.
@@ -847,12 +851,11 @@ class LiveEventDetectorGem:
             except Exception as e:
                 self.logger.error(f"Telegram alert error: {e}", exc_info=True)
         
-        try:
-            # Try to get the running loop and schedule the coroutine
-            loop = asyncio.get_running_loop()
-            asyncio.run_coroutine_threadsafe(send_alert(), loop)
-        except RuntimeError:
-            # No loop running, use threading with asyncio.run
+        if self.main_loop and self.main_loop.is_running():
+            asyncio.run_coroutine_threadsafe(send_alert(), self.main_loop)
+        else:
+            # Fallback if no loop configured
+            self.logger.error("Main loop not configured for Telegram alert")
             def send_async():
                 try:
                     asyncio.run(send_alert())
@@ -942,10 +945,9 @@ class LiveEventDetectorGem:
                         except Exception as e:
                             self.logger.error(f"TSL alert failed: {e}")
                     
-                    try:
-                        loop = asyncio.get_running_loop()
-                        asyncio.run_coroutine_threadsafe(send_tsl(), loop)
-                    except RuntimeError:
+                    if self.main_loop and self.main_loop.is_running():
+                        asyncio.run_coroutine_threadsafe(send_tsl(), self.main_loop)
+                    else:
                         def send_async():
                             try:
                                 asyncio.run(send_tsl())
@@ -977,12 +979,10 @@ class LiveEventDetectorGem:
                 except Exception as e:
                     self.logger.error(f"Exit alert failed: {e}")
             
-            try:
-                # Try to get the running loop and schedule the coroutine
-                loop = asyncio.get_running_loop()
-                asyncio.run_coroutine_threadsafe(send_exit(), loop)
-            except RuntimeError:
-                # No loop running, use threading with asyncio.run
+            if self.main_loop and self.main_loop.is_running():
+                asyncio.run_coroutine_threadsafe(send_exit(), self.main_loop)
+            else:
+                # Fallback
                 def send_async():
                     try:
                         asyncio.run(send_exit())
