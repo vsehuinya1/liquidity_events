@@ -21,7 +21,7 @@ from telegram_bot import TelegramBot
 from websocket_handler_improved import BinanceWebSocketFeed
 from strategy_orchestrator import StrategyOrchestrator
 from scheduled_reports import daily_report_task, weekly_report_task
-from config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
+from bot_config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
 
 
 # =============================================================================
