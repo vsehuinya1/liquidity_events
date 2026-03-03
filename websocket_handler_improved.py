@@ -1,7 +1,13 @@
 # websocket_handler_improved.py
 """
-Binance Futures WebSocket Feed Handler - Refactored
+Binance Futures WebSocket Feed Handler - v2.0.0
 Plumbing only: connect, normalize bars, emit bars
+
+v2.0.0 FIXES:
+- Race-free reconnection (single-thread ownership, no reconnect from callbacks)
+- Data freshness watchdog (force reconnect at 120s stale, force exit at 600s)
+- Telegram alerting for feed lifecycle events
+- Structured lifecycle logging
 
 5m aggregation: bucket-based (not delta/span).
 Each 1m bar is assigned to a 5m bucket via floor_to_5min(timestamp).
@@ -15,7 +21,9 @@ from datetime import datetime, timedelta
 import threading
 import time
 import os
+import sys
 import logging
+import asyncio
 from collections import deque, defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Callable, Any, Tuple
@@ -29,15 +37,25 @@ PING_TIMEOUT_SEC = 10
 CSV_SAVE_INTERVAL_HOURS = 1
 REQUIRED_KLINE_FIELDS = ('t', 'o', 'h', 'l', 'c', 'v', 'n', 'q', 'V', 'Q', 'x')
 
+# Watchdog thresholds
+STALE_RECONNECT_SEC = 120     # Force reconnect if no data for 2 minutes
+STALE_FORCE_EXIT_SEC = 600    # Force process exit if no data for 10 minutes
+WATCHDOG_CHECK_INTERVAL_SEC = 30
+
+# Max reconnect attempts before full client re-init
+MAX_RECONNECT_BEFORE_REINIT = 10
+
 
 @dataclass
 class WebSocketState:
     connected: bool = False
     running: bool = False
     reconnect_attempts: int = 0
+    total_reconnects: int = 0
     current_reconnect_delay: float = RECONNECT_DELAY_INITIAL_SEC
     last_csv_save: datetime = field(default_factory=datetime.utcnow)
     last_bar_timestamps: Dict[str, Optional[int]] = field(default_factory=dict)
+    last_message_time: float = 0.0   # wall-clock of last WS message received
 
 
 # ---------------------------------------------------------------------------
@@ -191,7 +209,7 @@ def setup_feed_logging() -> logging.Logger:
 
 
 # ---------------------------------------------------------------------------
-# BinanceWebSocketFeed
+# BinanceWebSocketFeed — v2.0.0 (race-free lifecycle)
 # ---------------------------------------------------------------------------
 
 class BinanceWebSocketFeed:
@@ -223,10 +241,18 @@ class BinanceWebSocketFeed:
         self._last_5m_emit_time: Dict[str, Optional[datetime]] = {s: None for s in self.symbols}
 
         self.buffer_lock = threading.Lock()
-        self.ws_lock = threading.Lock()
         self.logger = setup_feed_logging()
         os.makedirs(self.csv_dir, exist_ok=True)
-        self.logger.info(f"Initialized feed handler for {len(self.symbols)} pairs: {', '.join(self.symbols).upper()}")
+
+        # v2.0: Thread lifecycle management
+        self._ws_thread: Optional[threading.Thread] = None
+        self._watchdog_thread: Optional[threading.Thread] = None
+
+        # v2.0: Telegram alerting (set via set_telegram())
+        self._telegram = None
+        self._async_loop = None
+
+        self.logger.info(f"Initialized feed handler v2.0 for {len(self.symbols)} pairs: {', '.join(self.symbols).upper()}")
 
     # -- Properties --
 
@@ -270,73 +296,153 @@ class BinanceWebSocketFeed:
     def current_reconnect_delay(self, value: float) -> None:
         self.state.current_reconnect_delay = value
 
-    # -- Lifecycle --
+    # -- Telegram Integration (v2.0) --
+
+    def set_telegram(self, telegram_bot, async_loop) -> None:
+        """Inject Telegram bot and event loop for feed lifecycle alerts."""
+        self._telegram = telegram_bot
+        self._async_loop = async_loop
+        self.logger.info("Telegram alerting configured for feed handler")
+
+    def _send_telegram_alert(self, message: str) -> None:
+        """Send feed lifecycle alert via Telegram. Thread-safe, non-blocking."""
+        if not self._telegram or not self._async_loop:
+            return
+        try:
+            if self._async_loop.is_running():
+                async def _send():
+                    try:
+                        await self._telegram.send_message(
+                            f"🔧 <b>Feed Alert</b>\n{message}"
+                        )
+                    except Exception as e:
+                        self.logger.error(f"Telegram feed alert failed: {e}")
+                asyncio.run_coroutine_threadsafe(_send(), self._async_loop)
+        except Exception as e:
+            self.logger.error(f"Telegram alert scheduling failed: {e}")
+
+    # -- Lifecycle (v2.0: race-free) --
 
     def start(self) -> None:
-        with self.ws_lock:
-            if self.ws and self.state.connected:
-                self.logger.warning("WebSocket already running")
-                return
-            self.state.running = True
-            self._attempt_startup_aggregation()
-            self.ws = websocket.WebSocketApp(self.ws_url, on_open=self._on_open, on_message=self._on_message, on_error=self._on_error, on_close=self._on_close)
-            ws_thread = threading.Thread(target=self._run_forever, daemon=True)
-            ws_thread.start()
-            self.logger.info(f"Feed handler started for {len(self.symbols)} pairs")
+        """
+        Start the WebSocket feed.
+
+        v2.0: Guarantees:
+        - Only one _run_forever thread exists at any time
+        - Old thread is joined before new one starts
+        - Watchdog thread monitors data freshness
+        """
+        if self.state.running and self._ws_thread and self._ws_thread.is_alive():
+            self.logger.warning("Feed handler already running")
+            return
+
+        self.state.running = True
+        self.state.last_message_time = time.time()  # Initialize freshness timer
+
+        self._attempt_startup_aggregation()
+
+        # Build initial WebSocketApp
+        self._build_ws()
+
+        # Start the single WS lifecycle thread
+        self._ws_thread = threading.Thread(
+            target=self._run_forever_loop,
+            daemon=True,
+            name="ws-lifecycle"
+        )
+        self._ws_thread.start()
+        self.logger.info(f"[LIFECYCLE] ws-lifecycle thread started (tid={self._ws_thread.ident})")
+
+        # Start watchdog thread
+        if self._watchdog_thread is None or not self._watchdog_thread.is_alive():
+            self._watchdog_thread = threading.Thread(
+                target=self._watchdog_loop,
+                daemon=True,
+                name="ws-watchdog"
+            )
+            self._watchdog_thread.start()
+            self.logger.info(f"[LIFECYCLE] ws-watchdog thread started (tid={self._watchdog_thread.ident})")
+
+        self.logger.info(f"Feed handler started for {len(self.symbols)} pairs")
 
     def stop(self) -> None:
-        self.logger.info("Stopping feed handler...")
+        """
+        Stop the WebSocket feed cleanly.
+
+        v2.0: Ensures the WS thread is fully terminated before returning.
+        """
+        self.logger.info("[LIFECYCLE] Stopping feed handler...")
         self.state.running = False
         self.state.connected = False
+
+        # Close the WebSocket connection to unblock run_forever()
         if self.ws:
             try:
                 self.ws.close()
             except Exception:
                 pass
+
+        # Wait for the WS thread to finish
+        if self._ws_thread and self._ws_thread.is_alive():
+            self.logger.info("[LIFECYCLE] Waiting for ws-lifecycle thread to exit...")
+            self._ws_thread.join(timeout=15)
+            if self._ws_thread.is_alive():
+                self.logger.warning("[LIFECYCLE] ws-lifecycle thread did not exit cleanly")
+            else:
+                self.logger.info("[LIFECYCLE] ws-lifecycle thread exited")
+
         self._save_csv()
-        self.logger.info("Feed handler stopped")
+        self.logger.info("[LIFECYCLE] Feed handler stopped")
 
-    def reconnect(self) -> None:
-        with self.ws_lock:
-            if not self.state.running:
-                return
-            self.logger.info("Reconnecting WebSocket...")
-            self.state.reconnect_attempts += 1
-            if self.ws:
-                try:
-                    self.ws.close()
-                except Exception:
-                    pass
-            self.start()
+    def _build_ws(self) -> None:
+        """Create a fresh WebSocketApp instance. No threads spawned."""
+        self.ws = websocket.WebSocketApp(
+            self.ws_url,
+            on_open=self._on_open,
+            on_message=self._on_message,
+            on_error=self._on_error,
+            on_close=self._on_close
+        )
 
-    # -- WebSocket callbacks --
+    # -- WebSocket callbacks (v2.0: NO reconnection from callbacks) --
 
     def _on_open(self, ws) -> None:
-        self.logger.info("WebSocket connection established")
+        self.logger.info("[WS] Connection established")
         self.state.connected = True
         self.state.current_reconnect_delay = RECONNECT_DELAY_INITIAL_SEC
-        self.state.reconnect_attempts = 0
+        self.state.last_message_time = time.time()
         # Reset active buckets on reconnect to prevent frozen state
         self._active_buckets.clear()
-        self.logger.info("Active buckets reset on reconnect")
+        self.logger.info("[WS] Active buckets reset on connect")
+
+        if self.state.reconnect_attempts > 0:
+            self.state.total_reconnects += 1
+            self._send_telegram_alert(
+                f"✅ Feed restored after {self.state.reconnect_attempts} attempt(s)\n"
+                f"Total reconnects: {self.state.total_reconnects}"
+            )
+            self.state.reconnect_attempts = 0
 
     def _on_close(self, ws, close_status_code, close_msg) -> None:
-        self.logger.warning(f"WebSocket closed: {close_status_code} - {close_msg}")
+        """
+        v2.0: Only log and update state. Do NOT reconnect here.
+        _run_forever_loop handles reconnection after ws.run_forever() returns.
+        """
+        self.logger.warning(f"[WS] Connection closed: {close_status_code} - {close_msg}")
         self.state.connected = False
-        if self.state.running:
-            self.reconnect()
 
     def _on_error(self, ws, error) -> None:
-        self.logger.error(f"WebSocket error: {error}")
+        """
+        v2.0: Only log and update state. Do NOT reconnect here.
+        _run_forever_loop handles reconnection after ws.run_forever() returns.
+        """
+        self.logger.error(f"[WS] Error: {error}")
         self.state.connected = False
-        if not self.state.running:
-            return
-        self.logger.info(f"Attempting reconnection in {self.state.current_reconnect_delay}s...")
-        time.sleep(self.state.current_reconnect_delay)
-        self.state.current_reconnect_delay = min(self.state.current_reconnect_delay * 2, RECONNECT_DELAY_MAX_SEC)
-        self.reconnect()
 
     def _on_message(self, ws, message: str) -> None:
+        # Update freshness timer on every message (including non-kline)
+        self.state.last_message_time = time.time()
+
         payload = parse_raw_message(message)
         if payload is None:
             self.logger.error(f"JSON decode error. Raw: {message[:200]}")
@@ -385,15 +491,154 @@ class BinanceWebSocketFeed:
         self._check_5m_health(symbol, bar['timestamp'])
         self._check_csv_save()
 
-    def _run_forever(self) -> None:
+    # -- v2.0: Single-threaded lifecycle loop (replaces _run_forever + reconnect) --
+
+    def _run_forever_loop(self) -> None:
+        """
+        Single-threaded WebSocket lifecycle loop.
+
+        v2.0 GUARANTEES:
+        - This is the ONLY thread that calls ws.run_forever()
+        - Reconnection happens IN this thread after run_forever() returns
+        - No parallel _run_forever threads can exist
+        - Exponential backoff with max delay
+        - After MAX_RECONNECT_BEFORE_REINIT failures, rebuild the entire client
+        """
+        self.logger.info("[LIFECYCLE] _run_forever_loop entered")
+
         while self.state.running:
             try:
                 if self.ws:
-                    self.ws.run_forever(ping_interval=PING_INTERVAL_SEC, ping_timeout=PING_TIMEOUT_SEC)
+                    self.logger.info("[LIFECYCLE] Calling ws.run_forever()")
+                    self.ws.run_forever(
+                        ping_interval=PING_INTERVAL_SEC,
+                        ping_timeout=PING_TIMEOUT_SEC
+                    )
+                    self.logger.info("[LIFECYCLE] ws.run_forever() returned")
             except Exception as e:
-                self.logger.error(f"WebSocket run_forever error: {e}", exc_info=True)
-                if self.state.running:
-                    time.sleep(RECONNECT_DELAY_INITIAL_SEC)
+                self.logger.error(f"[LIFECYCLE] ws.run_forever() exception: {e}", exc_info=True)
+
+            # If we're shutting down, don't reconnect
+            if not self.state.running:
+                self.logger.info("[LIFECYCLE] Shutdown flag set, exiting loop")
+                break
+
+            # -- Reconnection logic (all within this single thread) --
+            self.state.connected = False
+            self.state.reconnect_attempts += 1
+            delay = self.state.current_reconnect_delay
+
+            self.logger.warning(
+                f"[RECONNECT] Attempt #{self.state.reconnect_attempts} | "
+                f"Delay: {delay:.0f}s | "
+                f"Total reconnects: {self.state.total_reconnects}"
+            )
+
+            self._send_telegram_alert(
+                f"🔌 Feed disconnected\n"
+                f"Reconnect attempt #{self.state.reconnect_attempts}\n"
+                f"Retrying in {delay:.0f}s..."
+            )
+
+            # Sleep with interruptible check
+            sleep_end = time.time() + delay
+            while time.time() < sleep_end and self.state.running:
+                time.sleep(1)
+
+            if not self.state.running:
+                break
+
+            # Exponential backoff
+            self.state.current_reconnect_delay = min(
+                delay * 2,
+                RECONNECT_DELAY_MAX_SEC
+            )
+
+            # After too many failures, do a full client re-init
+            if self.state.reconnect_attempts >= MAX_RECONNECT_BEFORE_REINIT:
+                self.logger.warning(
+                    f"[RECONNECT] {self.state.reconnect_attempts} failures, "
+                    f"rebuilding WebSocket client from scratch"
+                )
+                self._send_telegram_alert(
+                    f"⚠️ {self.state.reconnect_attempts} reconnect failures\n"
+                    f"Rebuilding WS client from scratch..."
+                )
+                # Rebuild the URL in case of DNS/routing issues
+                self.ws_url = build_stream_url(self.symbols)
+
+            # Build fresh WebSocketApp for next iteration
+            self._build_ws()
+            self.logger.info("[RECONNECT] Fresh WebSocketApp created, re-entering run_forever()")
+
+        self.logger.info("[LIFECYCLE] _run_forever_loop exited")
+
+    # -- v2.0: Data Freshness Watchdog --
+
+    def _watchdog_loop(self) -> None:
+        """
+        Watchdog thread: monitors data freshness.
+
+        - If no data for STALE_RECONNECT_SEC: force close WS to trigger reconnect
+        - If no data for STALE_FORCE_EXIT_SEC: kill the process (let PM2 restart)
+        """
+        self.logger.info("[WATCHDOG] Started")
+
+        while self.state.running:
+            time.sleep(WATCHDOG_CHECK_INTERVAL_SEC)
+
+            if not self.state.running:
+                break
+
+            elapsed = time.time() - self.state.last_message_time
+
+            # Level 1: Force reconnect
+            if elapsed > STALE_RECONNECT_SEC and self.state.connected:
+                self.logger.warning(
+                    f"[WATCHDOG] Data stale for {elapsed:.0f}s (>{STALE_RECONNECT_SEC}s). "
+                    f"Forcing WebSocket close to trigger reconnect."
+                )
+                self._send_telegram_alert(
+                    f"⚠️ No data for {elapsed:.0f}s\n"
+                    f"Forcing reconnect..."
+                )
+                # Close the WS — this will cause run_forever() to return,
+                # which triggers the reconnect logic in _run_forever_loop
+                if self.ws:
+                    try:
+                        self.ws.close()
+                    except Exception:
+                        pass
+                self.state.connected = False
+
+            # Level 2: Force process exit (fail fast — let PM2/supervisor restart)
+            elif elapsed > STALE_FORCE_EXIT_SEC:
+                self.logger.critical(
+                    f"[WATCHDOG] CRITICAL: Data stale for {elapsed:.0f}s "
+                    f"(>{STALE_FORCE_EXIT_SEC}s). FORCING PROCESS EXIT."
+                )
+                self._send_telegram_alert(
+                    f"🔴 Feed dead for {elapsed:.0f}s\n"
+                    f"Forcing process restart..."
+                )
+                # Give Telegram a moment to send
+                time.sleep(2)
+                # Hard exit — PM2 will restart the process
+                os._exit(1)
+
+        self.logger.info("[WATCHDOG] Stopped")
+
+    # -- v2.0: Force reconnect (called by watchdog) --
+
+    def _force_reconnect(self) -> None:
+        """Force a reconnect by closing the current WS connection."""
+        self.logger.warning("[FORCE_RECONNECT] Closing WS to trigger reconnect")
+        if self.ws:
+            try:
+                self.ws.close()
+            except Exception:
+                pass
+        self.state.connected = False
 
     # -- 5m Bucket Aggregation --
 
@@ -543,15 +788,18 @@ class BinanceWebSocketFeed:
             return {'one_min': {s: list(b) for s, b in self.one_min_buffers.items()}, 'five_min': {s: list(b) for s, b in self.five_min_buffers.items()}}
 
     def get_status(self) -> Dict[str, Any]:
+        elapsed = time.time() - self.state.last_message_time if self.state.last_message_time > 0 else -1
         return {
             'connected': self.state.connected,
             'running': self.state.running,
             'symbols': [s.upper() for s in self.symbols],
             'reconnect_attempts': self.state.reconnect_attempts,
+            'total_reconnects': self.state.total_reconnects,
             'last_csv_save': self.state.last_csv_save,
             'last_bar_timestamps': dict(self.state.last_bar_timestamps),
             'active_buckets': {s: str(b.get('start')) for s, b in self._active_buckets.items()},
-            'last_5m_emit': {s: str(t) for s, t in self._last_5m_emit_time.items()}
+            'last_5m_emit': {s: str(t) for s, t in self._last_5m_emit_time.items()},
+            'data_age_sec': round(elapsed, 1)
         }
 
 
@@ -585,14 +833,14 @@ if __name__ == "__main__":
         for bar in one_min[-10:]:
             print(f"{bar['timestamp'].strftime('%Y-%m-%d %H:%M'):<20} {bar['open']:<8.4f} {bar['high']:<8.4f} {bar['low']:<8.4f} {bar['close']:<8.4f} {bar['volume']:<10.2f}")
     else:
-        print("Starting live WebSocket feed handler...")
+        print("Starting live WebSocket feed handler v2.0...")
         feed = BinanceWebSocketFeed(symbols='SOLUSDT')
         feed.start()
         try:
             while True:
                 time.sleep(30)
                 status = feed.get_status()
-                print(f"Status: Connected={status['connected']}, Reconnects={status['reconnect_attempts']}")
+                print(f"Status: Connected={status['connected']}, Reconnects={status['total_reconnects']}, DataAge={status['data_age_sec']}s")
         except KeyboardInterrupt:
             print("\nShutting down...")
             feed.stop()

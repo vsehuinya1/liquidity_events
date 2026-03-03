@@ -159,6 +159,7 @@ def create_websocket_feed(
     """
     Factory: Create configured WebSocket feed.
     No side effects until .start() is called.
+    Telegram and async loop are injected separately via set_telegram().
     """
     return BinanceWebSocketFeed(
         symbols=list(active_pairs),
@@ -276,6 +277,7 @@ class TestnetVerificationSystem:
             # Start WebSocket feed (daemon thread)
             self.logger.info(f"Connecting to Binance Testnet Stream for {list(self.state.active_pairs)}...")
             feed = create_websocket_feed(self.state.active_pairs, self.orchestrator)
+            feed.set_telegram(bot, asyncio.get_running_loop())
             feed.start()
             
             self.logger.info("✅ SYSTEM LIVE. Listening for Signals & /KILL command...")
