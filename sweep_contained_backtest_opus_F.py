@@ -78,6 +78,16 @@ COOLDOWN_ATR = 1.2
 # v1.4.0: Time-of-day kill zones (UTC hours negative in BOTH backtest AND live)
 KILL_HOURS_UTC = frozenset({2, 5, 9, 12, 13, 15, 16, 21})
 
+# v1.5.0: ATR dead zone — Q2 quartile has 29.2% WR vs 38% rest
+ATR_DEAD_ZONE_LOW = 0.074
+ATR_DEAD_ZONE_HIGH = 0.104
+
+# v1.5.0: Saturday kill
+KILL_DAYS_OF_WEEK = frozenset({5})
+
+# v1.5.0: Direction-specific kills
+KILL_DIRECTION_COMBOS = frozenset({(10, 'LONG'), (18, 'SHORT'), (23, 'SHORT')})
+
 # v1.4.0: Adaptive trailing stop constants
 ADAPTIVE_TRAIL_PROFIT_THRESHOLD_R = 0.5
 ADAPTIVE_TRAIL_TIGHT_MULT = 1.2
@@ -493,6 +503,26 @@ def run_backtest(args):
             pending_sweep = None
             active_bias = None
             continue
+
+        # v1.5.0: Day-of-week filter
+        bar_dow = timestamp.weekday() if hasattr(timestamp, 'weekday') else pd.to_datetime(timestamp).weekday()
+        if bar_dow in KILL_DAYS_OF_WEEK:
+            pending_sweep = None
+            active_bias = None
+            continue
+
+        # v1.5.0: ATR dead zone filter
+        if ATR_DEAD_ZONE_LOW <= row['atr'] < ATR_DEAD_ZONE_HIGH:
+            pending_sweep = None
+            active_bias = None
+            continue
+
+        # v1.5.0: Direction-specific kill
+        if (bar_hour, active_bias) in KILL_DIRECTION_COMBOS:
+            pending_sweep = None
+            active_bias = None
+            continue
+
         if logger: logger.info(f"[ARMED] {active_bias} sweep at {timestamp}")
         active_bias = None  # Reset for next iteration
 

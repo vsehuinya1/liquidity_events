@@ -28,6 +28,20 @@ from telegram_bot import TelegramBot
 # Removed 04, 06, 20 which were profitable in live despite backtest showing negative.
 KILL_HOURS_UTC = frozenset({2, 5, 9, 12, 13, 15, 16, 21})
 
+# v1.5.0: ATR dead zone — Q2 quartile (0.074-0.104) has 29.2% WR vs 38% rest
+ATR_DEAD_ZONE_LOW = 0.074
+ATR_DEAD_ZONE_HIGH = 0.104
+
+# v1.5.0: Saturday (dow=5) has 18.2% WR with negligible edge
+KILL_DAYS_OF_WEEK = frozenset({5})  # 0=Mon, 5=Sat
+
+# v1.5.0: Direction-specific kills — (hour, direction) combos with < 15% WR
+KILL_DIRECTION_COMBOS = frozenset({
+    (10, 'LONG'),   # 14.3% WR, -6.0R
+    (18, 'SHORT'),  # 12.5% WR, -6.8R
+    (23, 'SHORT'),  #  0.0% WR, -5.7R
+})
+
 # Adaptive trailing stop: tighten multiplier after trade reaches this profit threshold
 ADAPTIVE_TRAIL_PROFIT_THRESHOLD_R = 0.5
 ADAPTIVE_TRAIL_TIGHT_MULT = 1.2  # Tighter trail (vs default 1.8)
@@ -769,6 +783,15 @@ class LiveEventDetectorGem:
         if bar_ts.hour in KILL_HOURS_UTC:
             return  # Intentional early return: kill hour
 
+        # v1.5.0: Day-of-week filter (Saturday)
+        if bar_ts.weekday() in KILL_DAYS_OF_WEEK:
+            return  # Intentional early return: kill day
+
+        # v1.5.0: ATR dead zone filter
+        current_atr = row.get('atr', 0)
+        if ATR_DEAD_ZONE_LOW <= current_atr < ATR_DEAD_ZONE_HIGH:
+            return  # Intentional early return: ATR dead zone
+
         # Check eligibility (pure function)
         if not check_sweep_eligibility(
             row, df,
@@ -782,6 +805,10 @@ class LiveEventDetectorGem:
         direction = detect_sweep_direction(row, filters.sweep_wick_pct)
 
         if direction:
+            # v1.5.0: Direction-specific kill
+            if (bar_ts.hour, direction) in KILL_DIRECTION_COMBOS:
+                return  # Intentional early return: bad hour/direction combo
+
             self.pending_sweep = PendingSweep(
                 bar_idx=current_idx,
                 bias=direction,
