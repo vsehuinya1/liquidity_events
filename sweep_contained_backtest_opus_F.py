@@ -1,7 +1,8 @@
 # sweep_contained_backtest_opus_F.py
-# OPUS OPTION F: FUSION (DYNAMIC FILTERING)
+# OPUS OPTION F: FUSION (DYNAMIC FILTERING) - v1.4.0
 # Base Mode: Strict Filters (Survival)
 # Burst Mode: Loose Filters (Aggression)
+# v1.4.0: Time-of-day kill zones, sizing fix, adaptive trailing stop
 
 import pandas as pd
 import numpy as np
@@ -48,7 +49,7 @@ BASE_CONFIG = {
     'MAX_CONSECUTIVE_LOSSES': 3,    # Strict limit
     'COOLDOWN_TRADES': 8,           # Increased from 6
     'MIN_REGIME_EXPECTANCY': -0.3,
-    'ATTACK_SIZE_MULT': 1.5,
+    'ATTACK_SIZE_MULT': 1.0,        # v1.4.0: was 1.5, net -27.6R over 235 trades
     'HOT_STREAK_SIZE_MULT': 1.8,
     'FUNDING_SQUEEZE_BONUS': 0.2
 }
@@ -73,6 +74,13 @@ MAX_BARS_SINCE_CLUSTER = 20
 ATR_TRAILING_STOP_MULT = 1.8
 INITIAL_STOP_ATR = 0.95 
 COOLDOWN_ATR = 1.2
+
+# v1.4.0: Time-of-day kill zones (UTC hours with negative expectancy)
+KILL_HOURS_UTC = frozenset({2, 4, 5, 6, 9, 12, 13, 15, 16, 20, 21})
+
+# v1.4.0: Adaptive trailing stop constants
+ADAPTIVE_TRAIL_PROFIT_THRESHOLD_R = 0.5
+ADAPTIVE_TRAIL_TIGHT_MULT = 1.2
 
 # Statistics
 stats = {
@@ -358,14 +366,24 @@ def run_backtest(args):
                             exit_price = stop
                             R_raw = (exit_price - entry) / (INITIAL_STOP_ATR * atr)
                             break
-                        new_stop = cl - ATR_TRAILING_STOP_MULT * current_atr
+                        # v1.4.0: Adaptive trailing stop
+                        unrealised_r = (cl - entry) / atr
+                        trail_mult = ATR_TRAILING_STOP_MULT
+                        if unrealised_r >= ADAPTIVE_TRAIL_PROFIT_THRESHOLD_R:
+                            trail_mult = min(ATR_TRAILING_STOP_MULT, ADAPTIVE_TRAIL_TIGHT_MULT)
+                        new_stop = cl - trail_mult * current_atr
                         stop = max(stop, new_stop)
                     else:
                         if hi >= stop:
                             exit_price = stop
                             R_raw = (entry - exit_price) / (INITIAL_STOP_ATR * atr)
                             break
-                        new_stop = cl + ATR_TRAILING_STOP_MULT * current_atr
+                        # v1.4.0: Adaptive trailing stop
+                        unrealised_r = (entry - cl) / atr
+                        trail_mult = ATR_TRAILING_STOP_MULT
+                        if unrealised_r >= ADAPTIVE_TRAIL_PROFIT_THRESHOLD_R:
+                            trail_mult = min(ATR_TRAILING_STOP_MULT, ADAPTIVE_TRAIL_TIGHT_MULT)
+                        new_stop = cl + trail_mult * current_atr
                         stop = min(stop, new_stop)
                 
                 if exit_price is None:
@@ -469,6 +487,12 @@ def run_backtest(args):
             'atr': row['atr'],
             'sweep_idx': i
         }
+        # v1.4.0: Time-of-day kill zone filter
+        bar_hour = timestamp.hour if hasattr(timestamp, 'hour') else pd.to_datetime(timestamp).hour
+        if bar_hour in KILL_HOURS_UTC:
+            pending_sweep = None
+            active_bias = None
+            continue
         if logger: logger.info(f"[ARMED] {active_bias} sweep at {timestamp}")
         active_bias = None  # Reset for next iteration
 

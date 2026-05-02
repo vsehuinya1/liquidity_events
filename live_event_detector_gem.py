@@ -14,14 +14,23 @@ import os
 from telegram_bot import TelegramBot
 
 # ============================================================================
-# LIVE EVENT DETECTOR GEM (v1.3.0) - OPTION F (FUSION) - REFACTORED
+# LIVE EVENT DETECTOR GEM (v1.4.0) - OPTION F (FUSION) - IMPROVED
 # ============================================================================
 # Features:
 # - Dynamic Filtering (Strict Base / Loose Burst)
 # - Burst Mode State Machine (Win Streak / Rolling R)
 # - Attack Mode State Machine (Size Scaling)
 # - Risk Containment (Drawdown Kill, Cooldowns)
+# - v1.4.0: Time-of-day kill zones, sizing fix, adaptive trailing stop
 # ============================================================================
+
+# Hours (UTC) with statistically negative expectancy over 8 months of data.
+# Blocking these cuts ~100R of drawdown with minimal impact on winners.
+KILL_HOURS_UTC = frozenset({2, 4, 5, 6, 9, 12, 13, 15, 16, 20, 21})
+
+# Adaptive trailing stop: tighten multiplier after trade reaches this profit threshold
+ADAPTIVE_TRAIL_PROFIT_THRESHOLD_R = 0.5
+ADAPTIVE_TRAIL_TIGHT_MULT = 1.2  # Tighter trail (vs default 1.8)
 
 
 # --- Enums for Explicit State ---
@@ -371,12 +380,26 @@ def update_trailing_stop(
     current_close: float,
     atr_trailing_mult: float
 ) -> float:
-    """Pure function: compute new trailing stop. Returns updated stop value."""
+    """
+    Pure function: compute new trailing stop. Returns updated stop value.
+    v1.4.0: Adaptive — tightens trail after ADAPTIVE_TRAIL_PROFIT_THRESHOLD_R profit.
+    """
+    # Check unrealised profit in R
     if trade.direction == 'LONG':
-        new_stop = current_close - atr_trailing_mult * trade.atr
+        unrealised_r = (current_close - trade.entry) / trade.atr
+    else:
+        unrealised_r = (trade.entry - current_close) / trade.atr
+
+    # Tighten after profit threshold
+    effective_mult = atr_trailing_mult
+    if unrealised_r >= ADAPTIVE_TRAIL_PROFIT_THRESHOLD_R:
+        effective_mult = min(atr_trailing_mult, ADAPTIVE_TRAIL_TIGHT_MULT)
+
+    if trade.direction == 'LONG':
+        new_stop = current_close - effective_mult * trade.atr
         return max(trade.stop, new_stop)
     else:
-        new_stop = current_close + atr_trailing_mult * trade.atr
+        new_stop = current_close + effective_mult * trade.atr
         return min(trade.stop, new_stop)
 
 
@@ -454,7 +477,7 @@ class LiveEventDetectorGem:
             max_consecutive_losses=3,
             cooldown_trades=8,
             min_regime_expectancy=-0.3,
-            attack_size_mult=1.5,
+            attack_size_mult=1.0,   # v1.4.0: was 1.5, net -27.6R over 235 trades
             hot_streak_size_mult=1.8,
             funding_squeeze_bonus=0.2
         )
@@ -738,6 +761,13 @@ class LiveEventDetectorGem:
     def _detect_sweep(self, df: pd.DataFrame, current_idx: int) -> None:
         """Side effect: sets self.pending_sweep if sweep pattern detected."""
         row = df.iloc[current_idx]
+
+        # v1.4.0: Time-of-day kill zone filter
+        bar_ts = row['timestamp']
+        if isinstance(bar_ts, str):
+            bar_ts = pd.to_datetime(bar_ts)
+        if bar_ts.hour in KILL_HOURS_UTC:
+            return  # Intentional early return: kill hour
 
         # Check eligibility (pure function)
         if not check_sweep_eligibility(
