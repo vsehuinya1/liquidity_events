@@ -504,9 +504,9 @@ class BinanceWebSocketFeed:
         self.state.connected = False
 
     def _on_message(self, ws, message: str) -> None:
-        # Update freshness timer on every WS message
+        # Update overall freshness on every WS message
         self.state.last_message_time = time.time()
-        self.state.last_ws_message_time = time.time()  # WS-specific
+        # NOTE: last_ws_message_time is only updated below when we get actual kline data
 
         payload = parse_raw_message(message)
         if payload is None:
@@ -518,6 +518,8 @@ class BinanceWebSocketFeed:
             if 'result' in payload:
                 self.logger.info(f"Subscription confirmed: {payload}")
             return
+        # Got actual kline data — WS is truly alive
+        self.state.last_ws_message_time = time.time()
         symbol = extract_symbol_from_kline(kline)
         if symbol not in self.symbols:
             return
