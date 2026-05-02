@@ -1,12 +1,10 @@
 # websocket_handler_improved.py
 """
-Binance Futures WebSocket Feed Handler - v2.0.0
+Binance Futures WebSocket Feed Handler - v2.1.0
 Plumbing only: connect, normalize bars, emit bars
 
-v2.0.0 FIXES:
-- Race-free reconnection (single-thread ownership, no reconnect from callbacks)
-- Data freshness watchdog (force reconnect at 120s stale, force exit at 600s)
-- Telegram alerting for feed lifecycle events
+v2.1.0: REST API polling fallback for futures klines when WS is dry
+v2.0.0: Race-free reconnection, watchdog, telegram alerts
 - Structured lifecycle logging
 
 5m aggregation: bucket-based (not delta/span).
@@ -24,6 +22,7 @@ import os
 import sys
 import logging
 import asyncio
+import urllib.request
 from collections import deque, defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Callable, Any, Tuple
@@ -38,12 +37,17 @@ CSV_SAVE_INTERVAL_HOURS = 1
 REQUIRED_KLINE_FIELDS = ('t', 'o', 'h', 'l', 'c', 'v', 'n', 'q', 'V', 'Q', 'x')
 
 # Watchdog thresholds
-STALE_RECONNECT_SEC = 120     # Force reconnect if no data for 2 minutes
-STALE_FORCE_EXIT_SEC = 600    # Force process exit if no data for 10 minutes
+STALE_RECONNECT_SEC = 300     # Force reconnect if no data for 5 minutes
+STALE_FORCE_EXIT_SEC = 1200    # Force process exit if no data for 20 minutes
 WATCHDOG_CHECK_INTERVAL_SEC = 30
 
 # Max reconnect attempts before full client re-init
 MAX_RECONNECT_BEFORE_REINIT = 10
+
+# v2.1.0: REST polling fallback
+REST_POLL_INTERVAL_SEC = 60       # Poll every 60s
+REST_STALE_THRESHOLD_SEC = 90     # Activate REST after 90s of no WS data
+REST_API_BASE = 'https://fapi.binance.com'  # Futures REST (confirmed working)
 
 
 @dataclass
@@ -52,6 +56,7 @@ class WebSocketState:
     running: bool = False
     reconnect_attempts: int = 0
     total_reconnects: int = 0
+    msg_count: int = 0
     current_reconnect_delay: float = RECONNECT_DELAY_INITIAL_SEC
     last_csv_save: datetime = field(default_factory=datetime.utcnow)
     last_bar_timestamps: Dict[str, Optional[int]] = field(default_factory=dict)
@@ -194,6 +199,44 @@ def build_stream_url(symbols: List[str]) -> str:
     return f"wss://fstream.binance.com/stream?streams={streams}"
 
 
+# ---------------------------------------------------------------------------
+# Pure functions: REST API polling (v2.1.0)
+# ---------------------------------------------------------------------------
+
+def fetch_rest_klines(symbol: str, interval: str = '1m', limit: int = 2) -> Optional[List[Dict[str, Any]]]:
+    """Fetch closed klines from Binance Futures REST API. Returns list of bar dicts or None on error."""
+    url = f"{REST_API_BASE}/fapi/v1/klines?symbol={symbol.upper()}&interval={interval}&limit={limit}"
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        bars = []
+        for k in data:
+            # Binance REST kline format: [open_time, open, high, low, close, volume, close_time, ...]
+            # Only process closed bars (close_time < now)
+            close_time_ms = int(k[6])
+            if close_time_ms > time.time() * 1000:
+                continue  # Bar not yet closed
+            bars.append({
+                'symbol': symbol.upper(),
+                'timestamp': pd.to_datetime(int(k[0]), unit='ms'),
+                'timestamp_ms': int(k[0]),
+                'open': float(k[1]),
+                'high': float(k[2]),
+                'low': float(k[3]),
+                'close': float(k[4]),
+                'volume': float(k[5]),
+                'n_trades': int(k[8]),
+                'quote_volume': float(k[7]),
+                'taker_buy_base': float(k[9]),
+                'taker_buy_quote': float(k[10]),
+                'is_closed': True
+            })
+        return bars
+    except Exception:
+        return None
+
+
 def setup_feed_logging() -> logging.Logger:
     log_dir = 'logs'
     os.makedirs(log_dir, exist_ok=True)
@@ -247,12 +290,14 @@ class BinanceWebSocketFeed:
         # v2.0: Thread lifecycle management
         self._ws_thread: Optional[threading.Thread] = None
         self._watchdog_thread: Optional[threading.Thread] = None
+        self._rest_poller_thread: Optional[threading.Thread] = None  # v2.1.0
+        self._rest_active: bool = False  # v2.1.0: True when REST is feeding data
 
         # v2.0: Telegram alerting (set via set_telegram())
         self._telegram = None
         self._async_loop = None
 
-        self.logger.info(f"Initialized feed handler v2.0 for {len(self.symbols)} pairs: {', '.join(self.symbols).upper()}")
+        self.logger.info(f"Initialized feed handler v2.1 for {len(self.symbols)} pairs: {', '.join(self.symbols).upper()}")
 
     # -- Properties --
 
@@ -363,6 +408,16 @@ class BinanceWebSocketFeed:
             self._watchdog_thread.start()
             self.logger.info(f"[LIFECYCLE] ws-watchdog thread started (tid={self._watchdog_thread.ident})")
 
+        # v2.1.0: Start REST poller thread
+        if self._rest_poller_thread is None or not self._rest_poller_thread.is_alive():
+            self._rest_poller_thread = threading.Thread(
+                target=self._rest_poller_loop,
+                daemon=True,
+                name="ws-rest-poller"
+            )
+            self._rest_poller_thread.start()
+            self.logger.info(f"[LIFECYCLE] REST poller thread started (tid={self._rest_poller_thread.ident})")
+
         self.logger.info(f"Feed handler started for {len(self.symbols)} pairs")
 
     def stop(self) -> None:
@@ -408,6 +463,13 @@ class BinanceWebSocketFeed:
 
     def _on_open(self, ws) -> None:
         self.logger.info("[WS] Connection established")
+        self.state.msg_count += 1
+        payload = {
+            "method": "SUBSCRIBE",
+            "params": [f"{s.lower()}@kline_1m" for s in self.symbols],
+            "id": self.state.msg_count
+        }
+        ws.send(json.dumps(payload))
         self.state.connected = True
         self.state.current_reconnect_delay = RECONNECT_DELAY_INITIAL_SEC
         self.state.last_message_time = time.time()
@@ -447,6 +509,7 @@ class BinanceWebSocketFeed:
         if payload is None:
             self.logger.error(f"JSON decode error. Raw: {message[:200]}")
             return
+        
         kline = extract_kline_from_payload(payload)
         if kline is None:
             if 'result' in payload:
@@ -639,6 +702,89 @@ class BinanceWebSocketFeed:
             except Exception:
                 pass
         self.state.connected = False
+
+    # -- v2.1.0: REST API Polling Fallback --
+
+    def _rest_poller_loop(self) -> None:
+        """
+        REST polling fallback thread (v2.1.0).
+        When WS data is stale for >REST_STALE_THRESHOLD_SEC, polls fapi.binance.com
+        for closed 1m klines and feeds them through the normal bar pipeline.
+        Deduplicates against already-seen bar timestamps.
+        """
+        self.logger.info("[REST_POLLER] Started")
+
+        while self.state.running:
+            time.sleep(REST_POLL_INTERVAL_SEC)
+
+            if not self.state.running:
+                break
+
+            elapsed = time.time() - self.state.last_message_time
+
+            # Only activate when WS is dry
+            if elapsed < REST_STALE_THRESHOLD_SEC:
+                if self._rest_active:
+                    self._rest_active = False
+                    self.logger.info("[REST_POLLER] WS data resumed, REST polling deactivated")
+                    self._send_telegram_alert("✅ WS data resumed, REST fallback deactivated")
+                continue
+
+            # WS is stale — activate REST polling
+            if not self._rest_active:
+                self._rest_active = True
+                self.logger.warning(f"[REST_POLLER] WS stale for {elapsed:.0f}s, activating REST fallback")
+                self._send_telegram_alert(
+                    f"⚠️ WS stale for {elapsed:.0f}s\n"
+                    f"REST polling fallback activated (fapi.binance.com)"
+                )
+
+            # Poll each symbol
+            for symbol in self.symbols:
+                bars = fetch_rest_klines(symbol, limit=3)
+                if bars is None:
+                    self.logger.error(f"[REST_POLLER] Failed to fetch klines for {symbol}")
+                    continue
+
+                for bar in bars:
+                    bar_ts_ms = bar['timestamp_ms']
+                    last_ts_ms = self.state.last_bar_timestamps.get(symbol)
+
+                    # Dedup: skip if already seen
+                    if not is_new_bar(bar_ts_ms, last_ts_ms):
+                        continue
+
+                    # Validate
+                    valid, error = validate_bar_integrity(
+                        bar['open'], bar['high'], bar['low'], bar['close'], bar['volume']
+                    )
+                    if not valid:
+                        self.logger.warning(f"[REST_POLLER] Bar integrity fail {symbol}: {error}")
+                        continue
+
+                    # Process bar through normal pipeline
+                    self.state.last_bar_timestamps[symbol] = bar_ts_ms
+                    self.state.last_message_time = time.time()  # Reset freshness
+
+                    with self.buffer_lock:
+                        self.one_min_buffers[symbol].append(bar)
+
+                    self.logger.info(
+                        f"{symbol.upper()} 1m [REST] | {bar['timestamp']} | "
+                        f"C:{bar['close']:.4f} V:{bar['volume']:.2f}"
+                    )
+
+                    # 1m callback
+                    if self.on_1min_bar_callback:
+                        try:
+                            self.on_1min_bar_callback(bar)
+                        except Exception as e:
+                            self.logger.error(f"[REST_POLLER] 1m callback error: {e}", exc_info=True)
+
+                    self._try_resample(symbol, bar)
+                    self._check_5m_health(symbol, bar['timestamp'])
+
+        self.logger.info("[REST_POLLER] Stopped")
 
     # -- 5m Bucket Aggregation --
 
