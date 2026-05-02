@@ -60,7 +60,8 @@ class WebSocketState:
     current_reconnect_delay: float = RECONNECT_DELAY_INITIAL_SEC
     last_csv_save: datetime = field(default_factory=datetime.utcnow)
     last_bar_timestamps: Dict[str, Optional[int]] = field(default_factory=dict)
-    last_message_time: float = 0.0   # wall-clock of last WS message received
+    last_message_time: float = 0.0       # wall-clock of last message (WS or REST)
+    last_ws_message_time: float = 0.0    # v2.1.0: wall-clock of last WS-only message
 
 
 # ---------------------------------------------------------------------------
@@ -383,6 +384,7 @@ class BinanceWebSocketFeed:
 
         self.state.running = True
         self.state.last_message_time = time.time()  # Initialize freshness timer
+        self.state.last_ws_message_time = time.time()  # Initialize WS freshness
 
         self._attempt_startup_aggregation()
 
@@ -502,8 +504,9 @@ class BinanceWebSocketFeed:
         self.state.connected = False
 
     def _on_message(self, ws, message: str) -> None:
-        # Update freshness timer on every message (including non-kline)
+        # Update freshness timer on every WS message
         self.state.last_message_time = time.time()
+        self.state.last_ws_message_time = time.time()  # WS-specific
 
         payload = parse_raw_message(message)
         if payload is None:
@@ -720,10 +723,10 @@ class BinanceWebSocketFeed:
             if not self.state.running:
                 break
 
-            elapsed = time.time() - self.state.last_message_time
+            elapsed_ws = time.time() - self.state.last_ws_message_time
 
-            # Only activate when WS is dry
-            if elapsed < REST_STALE_THRESHOLD_SEC:
+            # Only activate when WS is dry (use WS-specific timer)
+            if elapsed_ws < REST_STALE_THRESHOLD_SEC:
                 if self._rest_active:
                     self._rest_active = False
                     self.logger.info("[REST_POLLER] WS data resumed, REST polling deactivated")
@@ -733,9 +736,9 @@ class BinanceWebSocketFeed:
             # WS is stale — activate REST polling
             if not self._rest_active:
                 self._rest_active = True
-                self.logger.warning(f"[REST_POLLER] WS stale for {elapsed:.0f}s, activating REST fallback")
+                self.logger.warning(f"[REST_POLLER] WS stale for {elapsed_ws:.0f}s, activating REST fallback")
                 self._send_telegram_alert(
-                    f"⚠️ WS stale for {elapsed:.0f}s\n"
+                    f"⚠️ WS stale for {elapsed_ws:.0f}s\n"
                     f"REST polling fallback activated (fapi.binance.com)"
                 )
 
@@ -764,7 +767,7 @@ class BinanceWebSocketFeed:
 
                     # Process bar through normal pipeline
                     self.state.last_bar_timestamps[symbol] = bar_ts_ms
-                    self.state.last_message_time = time.time()  # Reset freshness
+                    self.state.last_message_time = time.time()  # Reset overall freshness (not WS)
 
                     with self.buffer_lock:
                         self.one_min_buffers[symbol].append(bar)
