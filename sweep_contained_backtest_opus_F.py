@@ -75,8 +75,8 @@ ATR_TRAILING_STOP_MULT = 1.8
 INITIAL_STOP_ATR = 0.95 
 COOLDOWN_ATR = 1.2
 
-# v1.4.0: Time-of-day kill zones (UTC hours with negative expectancy)
-KILL_HOURS_UTC = frozenset({2, 4, 5, 6, 9, 12, 13, 15, 16, 20, 21})
+# v1.4.0: Time-of-day kill zones (UTC hours negative in BOTH backtest AND live)
+KILL_HOURS_UTC = frozenset({2, 5, 9, 12, 13, 15, 16, 21})
 
 # v1.4.0: Adaptive trailing stop constants
 ADAPTIVE_TRAIL_PROFIT_THRESHOLD_R = 0.5

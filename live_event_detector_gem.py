@@ -24,9 +24,9 @@ from telegram_bot import TelegramBot
 # - v1.4.0: Time-of-day kill zones, sizing fix, adaptive trailing stop
 # ============================================================================
 
-# Hours (UTC) with statistically negative expectancy over 8 months of data.
-# Blocking these cuts ~100R of drawdown with minimal impact on winners.
-KILL_HOURS_UTC = frozenset({2, 4, 5, 6, 9, 12, 13, 15, 16, 20, 21})
+# Hours (UTC) with negative expectancy in BOTH backtest (8mo) AND live (84d) data.
+# Removed 04, 06, 20 which were profitable in live despite backtest showing negative.
+KILL_HOURS_UTC = frozenset({2, 5, 9, 12, 13, 15, 16, 21})
 
 # Adaptive trailing stop: tighten multiplier after trade reaches this profit threshold
 ADAPTIVE_TRAIL_PROFIT_THRESHOLD_R = 0.5
