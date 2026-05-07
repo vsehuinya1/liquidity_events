@@ -13,6 +13,9 @@ import asyncio
 import os
 from telegram_bot import TelegramBot
 
+# --- Kill Hours (UTC) ---
+KILL_HOURS_UTC = {2, 5, 9, 12, 13, 15, 16, 21}
+
 # ============================================================================
 # LIVE EVENT DETECTOR GEM (v1.3.0) - OPTION F (FUSION) - REFACTORED
 # ============================================================================
@@ -444,7 +447,7 @@ class LiveEventDetectorGem:
             max_consecutive_losses=10,
             cooldown_trades=0,
             min_regime_expectancy=-5.0,
-            attack_size_mult=2.0,
+            attack_size_mult=1.0,
             hot_streak_size_mult=2.5,
             funding_squeeze_bonus=0.5
         )
@@ -454,7 +457,7 @@ class LiveEventDetectorGem:
             max_consecutive_losses=3,
             cooldown_trades=8,
             min_regime_expectancy=-0.3,
-            attack_size_mult=1.5,
+            attack_size_mult=1.0,
             hot_streak_size_mult=1.8,
             funding_squeeze_bonus=0.2
         )
@@ -737,6 +740,11 @@ class LiveEventDetectorGem:
 
     def _detect_sweep(self, df: pd.DataFrame, current_idx: int) -> None:
         """Side effect: sets self.pending_sweep if sweep pattern detected."""
+        # Kill hour filter
+        current_hour = datetime.utcnow().hour
+        if current_hour in KILL_HOURS_UTC:
+            return  # Intentional early return: kill hour active
+
         row = df.iloc[current_idx]
 
         # Check eligibility (pure function)
