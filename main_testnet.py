@@ -11,6 +11,7 @@ Architecture:
 
 import asyncio
 import logging
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Callable, Any
@@ -85,6 +86,20 @@ def setup_logging() -> logging.Logger:
         ]
     )
     return logging.getLogger("SystemMain")
+
+
+def get_git_info():
+    """Get current git branch and short commit hash."""
+    try:
+        branch = subprocess.check_output(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
+            stderr=subprocess.DEVNULL).decode().strip()
+        commit = subprocess.check_output(
+            ['git', 'rev-parse', '--short', 'HEAD'],
+            stderr=subprocess.DEVNULL).decode().strip()
+        return branch, commit
+    except Exception:
+        return 'unknown', 'unknown'
 
 
 # =============================================================================
@@ -215,7 +230,7 @@ class TestnetVerificationSystem:
             - All subsequent signals are blocked
             - Executor's own kill-switch is also triggered
         """
-        def trigger_kill_switch():
+        async def trigger_kill_switch():
             self.state.kill_switch_triggered = True
             self.state.running = False
             self.logger.critical("🛑 KILL SWITCH TRIGGERED - All execution halted")
@@ -284,10 +299,15 @@ class TestnetVerificationSystem:
 
             # Telegram startup notification
             pairs_str = ', '.join(self.state.active_pairs)
+            branch, commit_hash = get_git_info()
+            chat_display = TELEGRAM_CHAT_ID[:4] + '...' + TELEGRAM_CHAT_ID[-4:]
             await bot.send_message(
-                f"🟢 <b>System Online</b>\n"
+                f"🟢 <b>BOT ONLINE</b>\n"
+                f"Branch: <code>{branch}</code>\n"
+                f"Commit: <code>{commit_hash}</code>\n"
                 f"Pairs: {pairs_str}\n"
-                f"Feed: 1m direct (backtest-equivalent)\n"
+                f"Feed: 1m REST fallback\n"
+                f"Chat: {chat_display}\n"
                 f"Kill: /KILL"
             )
 

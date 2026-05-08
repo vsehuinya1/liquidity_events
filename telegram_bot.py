@@ -44,6 +44,7 @@ DIRECTION_EMOJIS: Dict[str, str] = {
 # Commands
 COMMAND_KILL = '/KILL'
 COMMAND_PING = '/PING'
+COMMAND_START = '/START'
 
 
 # =============================================================================
@@ -173,6 +174,11 @@ def is_kill_command(text: str) -> bool:
 def is_ping_command(text: str) -> bool:
     """Check if text is ping command."""
     return extract_command(text) == COMMAND_PING
+
+
+def is_start_command(text: str) -> bool:
+    """Check if text is start command."""
+    return extract_command(text) == COMMAND_START
 
 
 # =============================================================================
@@ -382,6 +388,8 @@ class TelegramBot:
             await self._handle_kill_command()
         elif is_ping_command(text):
             await self._handle_ping_command()
+        elif is_start_command(text):
+            await self._handle_start_command()
         # Unknown commands silently ignored
 
     async def _handle_kill_command(self) -> None:
@@ -412,6 +420,11 @@ class TelegramBot:
         """Handle /PING command."""
         await self._send_message("Pong! System Active.")
 
+    async def _handle_start_command(self) -> None:
+        """Handle /START command."""
+        self.logger.info("/START command received")
+        await self._send_message("Bot online. Alerts enabled.")
+
     # =========================================================================
     # MESSAGE SENDING
     # =========================================================================
@@ -421,6 +434,7 @@ class TelegramBot:
         Send message via Telegram API.
         Side effect: HTTP request.
         Returns True on success, False on failure.
+        Logs failures with HTTP code and response body.
         """
         await self._ensure_session()
         
@@ -435,8 +449,17 @@ class TelegramBot:
         
         try:
             async with self.session.post(f"{self.base_url}/sendMessage", json=payload) as response:
-                return response.status == 200
-        except Exception:
+                if response.status == 200:
+                    return True
+                else:
+                    body = await response.text()
+                    self.logger.error(
+                        f"Telegram send FAILED | HTTP {response.status} | "
+                        f"chat_id={self.chat_id} | response={body[:200]}"
+                    )
+                    return False
+        except Exception as e:
+            self.logger.error(f"Telegram send EXCEPTION | chat_id={self.chat_id} | {e}")
             return False
 
     # Alias for external callers

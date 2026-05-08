@@ -657,16 +657,33 @@ class TestnetTradeExecutor:
                             pair=symbol,
                             direction=direction,
                             entry_price=fill_price,
-                            stop_price=initial_stop,
-                            timestamp=datetime.now()
+                            event_type="sweep",
+                            stop_loss=initial_stop,
+                            take_profit=0.0,
+                            atr=atr,
+                            timestamp=datetime.now(),
                         )
                     except Exception as e:
                         self.logger.warning(f"Entry alert failed: {e}")
                 
             except BinanceAPIException as e:
                 self.logger.error(f"Entry failed [{trade_id}] {symbol}: {e.code} - {e.message}")
+                if self.telegram:
+                    try:
+                        await self.telegram.send_error_alert(
+                            f"Entry REJECTED [{trade_id}] {symbol} {direction}: {e.code} - {e.message}"
+                        )
+                    except Exception:
+                        pass
             except Exception as e:
                 self.logger.error(f"Entry failed [{trade_id}] {symbol}: {e}")
+                if self.telegram:
+                    try:
+                        await self.telegram.send_error_alert(
+                            f"Entry FAILED [{trade_id}] {symbol}: {e}"
+                        )
+                    except Exception:
+                        pass
 
     def trigger_kill_switch(self) -> None:
         """Trigger the kill switch."""
