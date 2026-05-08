@@ -43,6 +43,7 @@ Thumbs.db
 
 # Project specific - sensitive data
 config.py
+bot_config.py
 
 # Data files (large)
 data/
