@@ -14,7 +14,9 @@ import os
 from telegram_bot import TelegramBot
 
 # --- Kill Hours (UTC) ---
-KILL_HOURS_UTC = {2, 5, 9, 12, 13, 15, 16, 21}
+# v1.4.0 original: {2, 5, 9, 12, 13, 15, 16, 21}
+# +2026-07-04 audit: added 00h (-7.26R), 03h (-7.00R), 08h (-6.97R) from June live data
+KILL_HOURS_UTC = {0, 2, 3, 5, 8, 9, 12, 13, 15, 16, 21}
 
 # ============================================================================
 # LIVE EVENT DETECTOR GEM (v1.3.0) - OPTION F (FUSION) - REFACTORED

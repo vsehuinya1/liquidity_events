@@ -38,6 +38,9 @@ METRIC_CSV_HEADER = "Time_Signal,Time_Sent,Time_Ack,Latency_Int_ms,Latency_Net_m
 BASE_SIZE_USD = 100
 LATENCY_THRESHOLD_MS = 3000
 TRAILING_STOP_MULTIPLIER = 1.8
+# Adaptive trailing stop (v1.4.0): tighten after this profit threshold
+ADAPTIVE_TRAIL_PROFIT_THRESHOLD_R = 0.5
+ADAPTIVE_TRAIL_TIGHT_MULT = 1.2   # tightened multiplier (vs default 1.8)
 HARD_STOP_DISTANCE_PERCENT = 0.10
 TRAILING_LOOP_INTERVAL_SEC = 5
 RECONCILIATION_INTERVAL_SEC = 60
@@ -121,13 +124,38 @@ def compute_hard_stop_price(fill_price: float, direction: str, distance_pct: flo
     return round(fill_price + hard_dist, 2)
 
 
-def compute_trailing_stop(current_price: float, current_stop: float, atr: float, direction: str, multiplier: float = TRAILING_STOP_MULTIPLIER) -> tuple:
+def compute_trailing_stop(
+    current_price: float,
+    current_stop: float,
+    atr: float,
+    direction: str,
+    multiplier: float = TRAILING_STOP_MULTIPLIER,
+    entry_price: float = None,          # None = legacy callers; pass for adaptive
+    initial_stop_atr: float = 1.5,      # matches executor entry: atr * 1.5
+) -> tuple:
+    """
+    Compute next trailing stop price.
+    v1.4.0 adaptive: tighten multiplier from 1.8 to 1.2 once unrealised
+    profit exceeds ADAPTIVE_TRAIL_PROFIT_THRESHOLD_R.
+    Pure function — no side effects.
+    """
+    effective_mult = multiplier
+    if entry_price is not None and atr > 0:
+        initial_risk = atr * initial_stop_atr          # 1R in price terms
+        if initial_risk > 0:
+            if direction == 'LONG':
+                unrealised_r = (current_price - entry_price) / initial_risk
+            else:
+                unrealised_r = (entry_price - current_price) / initial_risk
+            if unrealised_r >= ADAPTIVE_TRAIL_PROFIT_THRESHOLD_R:
+                effective_mult = min(multiplier, ADAPTIVE_TRAIL_TIGHT_MULT)
+
     if direction == 'LONG':
-        proposed = current_price - (multiplier * atr)
+        proposed = current_price - (effective_mult * atr)
         if proposed > current_stop:
             return proposed, True
     else:
-        proposed = current_price + (multiplier * atr)
+        proposed = current_price + (effective_mult * atr)
         if proposed < current_stop:
             return proposed, True
     return current_stop, False
@@ -771,10 +799,11 @@ class TestnetTradeExecutor:
                     continue
                 
                 new_stop, should_update = compute_trailing_stop(
-                    current_price, 
-                    current_stop_price, 
-                    current_atr, 
-                    position['direction']
+                    current_price,
+                    current_stop_price,
+                    current_atr,
+                    position['direction'],
+                    entry_price=position.get('entry_price'),  # adaptive trailing stop
                 )
                 
                 if not should_update:
